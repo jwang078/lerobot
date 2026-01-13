@@ -14,10 +14,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Import splatsim_lerobot submodule to trigger registration
-# (Other robots are imported by scripts that use them, but for new robots
-# we import here to ensure they're registered with draccus)
-from . import splatsim_lerobot  # noqa: F401
-from .config import RobotConfig
-from .robot import Robot
-from .utils import make_robot_from_config
+from .config_splatsim_lerobot import SplatSimLerobotConfig
+from .splatsim_lerobot import SplatSimLerobot
