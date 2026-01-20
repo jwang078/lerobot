@@ -21,13 +21,33 @@ This script uses recorded trajectories from a zarr database as simulated
 "human input" to test PI0.5 shared autonomy. It follows the same policy
 loading pattern as lerobot_record.py with proper preprocessors/postprocessors.
 
-Usage:
+Features:
+- Tests multiple forward_flow_ratios to blend human and policy actions
+- Computes deviation metrics between human and policy trajectories
+- Optionally saves policy trajectories back to zarr format with auto-incrementing
+
+Usage (basic testing):
     python examples/test_shared_autonomy_with_trajectories.py \
         --policy_path /path/to/pi05/model \
         --traj_folder /path/to/trajectories.zarr \
         --dataset_repo_id your/dataset \
         --num_trajectories 5 \
         --forward_flow_ratios 0.0 0.2 0.4 0.6 0.8 1.0
+
+Usage (with trajectory saving):
+    python examples/test_shared_autonomy_with_trajectories.py \
+        --policy_path /path/to/pi05/model \
+        --traj_folder /path/to/trajectories.zarr \
+        --dataset_repo_id your/dataset \
+        --num_trajectories 5 \
+        --forward_flow_ratios 0.0 0.2 0.4 0.6 0.8 1.0 \
+        --save_trajectories \
+        --save_ratios 0.4 0.6 0.8 \
+        --output_suffix _sapi05
+
+The output zarr folder will have the same structure as input with suffix added.
+For example: trajectories.zarr -> trajectories_sapi05.zarr
+Trajectories are auto-incremented within each scenario/obstacle_config group.
 """
 
 import argparse
@@ -119,6 +139,135 @@ class TrajectoryLoader:
 
     def __len__(self):
         return len(self.trajectories)
+
+
+class TrajectorySaver:
+    """Saves trajectories to zarr database with the same structure as input."""
+
+    def __init__(self, input_traj_folder: str, output_suffix: str = "_sapi05"):
+        """Initialize saver with output folder path.
+
+        Args:
+            input_traj_folder: Path to input .zarr trajectory folder
+            output_suffix: Suffix to append to create output folder name
+        """
+        assert input_traj_folder.endswith('.zarr'), "Input folder must be .zarr"
+
+        # Create output folder path by adding suffix before .zarr
+        self.input_folder = input_traj_folder
+        self.output_folder = input_traj_folder.replace('.zarr', f'{output_suffix}.zarr')
+
+        # Open output zarr in append mode (create if doesn't exist)
+        self.root = zarr.open(self.output_folder, mode='a')
+
+        # Ensure trajectories group exists
+        if 'trajectories' not in self.root:
+            self.root.create_group('trajectories')
+
+        self.trajectories_group = self.root['trajectories']
+
+        print(f"Trajectory saver initialized:")
+        print(f"  Input:  {self.input_folder}")
+        print(f"  Output: {self.output_folder}")
+
+    def _get_next_traj_number(self, obstacle_config_group) -> int:
+        """Find the next available trajectory number in an obstacle config.
+
+        Args:
+            obstacle_config_group: The zarr group for the obstacle config
+
+        Returns:
+            Next available trajectory number (e.g., 0, 1, 2, ...)
+        """
+        traj_re = re.compile(r"^traj_(\d+)$")
+        existing_nums = []
+
+        for key in obstacle_config_group.keys():
+            m = traj_re.match(key)
+            if m:
+                existing_nums.append(int(m.group(1)))
+
+        if not existing_nums:
+            return 0
+
+        return max(existing_nums) + 1
+
+    def save_trajectory(
+        self,
+        scenario_name: str,
+        obstacle_config_name: str,
+        qs: np.ndarray,
+        metadata: dict,
+    ) -> str:
+        """Save a trajectory to the zarr database.
+
+        Args:
+            scenario_name: Scenario name (e.g., "scenario_0000")
+            obstacle_config_name: Obstacle config name (e.g., "obstacle_config_00")
+            qs: Joint positions array [T, action_dim]
+            metadata: Obstacle configuration metadata dict
+
+        Returns:
+            Full trajectory path (e.g., "scenario_0000_obstacle_config_00_traj_02")
+        """
+        # Ensure scenario group exists
+        if scenario_name not in self.trajectories_group:
+            self.trajectories_group.create_group(scenario_name)
+        scenario_group = self.trajectories_group[scenario_name]
+
+        # Ensure obstacle config group exists
+        if obstacle_config_name not in scenario_group:
+            obs_group = scenario_group.create_group(obstacle_config_name)
+            # Store metadata as JSON in attrs
+            obs_group.attrs['metadata'] = json.dumps(metadata)
+        else:
+            obs_group = scenario_group[obstacle_config_name]
+
+        # Find next available trajectory number
+        traj_num = self._get_next_traj_number(obs_group)
+        traj_name = f"traj_{traj_num:02d}"
+
+        # Create trajectory group and save qs
+        traj_group = obs_group.create_group(traj_name)
+        traj_group.create_dataset('qs', data=qs, dtype='f4')
+
+        full_name = f"{scenario_name}_{obstacle_config_name}_{traj_name}"
+        print(f"  Saved: {full_name} (shape: {qs.shape})")
+
+        return full_name
+
+    def save_from_test_result(
+        self,
+        traj_data: dict,
+        policy_actions: np.ndarray,
+        forward_flow_ratio: float,
+    ) -> str:
+        """Save policy actions from a test result using original trajectory metadata.
+
+        Args:
+            traj_data: Original trajectory data dict (from TrajectoryLoader.get_trajectory)
+            policy_actions: Policy action array [T, action_dim]
+            forward_flow_ratio: The forward flow ratio used for this test
+
+        Returns:
+            Full trajectory path
+        """
+        # Parse scenario and obstacle config from original name
+        # Format: "scenario_0000_obstacle_config_00_traj_00"
+        name_parts = traj_data['name'].split('_')
+        scenario_name = f"{name_parts[0]}_{name_parts[1]}"  # "scenario_0000"
+        obstacle_config_name = f"{name_parts[2]}_{name_parts[3]}_{name_parts[4]}"  # "obstacle_config_00"
+
+        # Use original metadata
+        metadata = traj_data['metadata']
+
+        # Save trajectory
+        return self.save_trajectory(
+            scenario_name=scenario_name,
+            obstacle_config_name=obstacle_config_name,
+            qs=policy_actions,
+            metadata=metadata,
+        )
 
 
 class SharedAutonomyTester:
@@ -427,6 +576,7 @@ class SharedAutonomyTester:
 
         return {
             "traj_name": traj_name,
+            "traj_data": traj_data,  # Include original trajectory data
             "forward_flow_ratio": forward_flow_ratio,
             "num_steps": T,
             "metrics": metrics,
@@ -522,6 +672,24 @@ def main():
         default="obstacle avoidance in scenario_0000",
         help="Language task description (placeholder for testing)",
     )
+    parser.add_argument(
+        "--save_trajectories",
+        action="store_true",
+        help="Save policy trajectories to zarr format",
+    )
+    parser.add_argument(
+        "--output_suffix",
+        type=str,
+        default="_sapi05",
+        help="Suffix to add to output zarr folder name (default: _sapi05)",
+    )
+    parser.add_argument(
+        "--save_ratios",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Which forward_flow_ratios to save (default: all tested ratios)",
+    )
 
     args = parser.parse_args()
 
@@ -541,6 +709,18 @@ def main():
         task_description=args.task_description,
     )
 
+    # Initialize trajectory saver if requested
+    traj_saver = None
+    if args.save_trajectories:
+        traj_saver = TrajectorySaver(
+            input_traj_folder=args.traj_folder,
+            output_suffix=args.output_suffix,
+        )
+        print()
+
+    # Determine which ratios to save
+    save_ratios_set = set(args.save_ratios) if args.save_ratios else set(args.forward_flow_ratios)
+
     # Test multiple trajectories
     all_results = []
 
@@ -556,6 +736,20 @@ def main():
         )
 
         all_results.append(results)
+
+        # Save trajectories if requested
+        if traj_saver:
+            print("\nSaving trajectories:")
+            for ratio, result in results.items():
+                if ratio in save_ratios_set:
+                    # Convert policy_actions back to 6-DOF (remove gripper) if needed
+                    policy_actions_6dof = result["policy_actions"][:, :6]
+
+                    traj_saver.save_from_test_result(
+                        traj_data=result["traj_data"],
+                        policy_actions=policy_actions_6dof,
+                        forward_flow_ratio=ratio,
+                    )
 
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -581,6 +775,11 @@ def main():
 
     print(f"\n{'='*80}")
     print(f"Results saved to: {output_file}")
+    if traj_saver:
+        print(f"Trajectories saved to: {traj_saver.output_folder}")
+        total_saved = len(save_ratios_set) * args.num_trajectories
+        print(f"  Total trajectories saved: {total_saved}")
+        print(f"  Ratios saved: {sorted(save_ratios_set)}")
     print(f"{'='*80}")
 
 
