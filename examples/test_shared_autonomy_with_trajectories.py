@@ -1,0 +1,588 @@
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Test Shared Autonomy with Trajectory Database
+
+This script uses recorded trajectories from a zarr database as simulated
+"human input" to test PI0.5 shared autonomy. It follows the same policy
+loading pattern as lerobot_record.py with proper preprocessors/postprocessors.
+
+Usage:
+    python examples/test_shared_autonomy_with_trajectories.py \
+        --policy_path /path/to/pi05/model \
+        --traj_folder /path/to/trajectories.zarr \
+        --dataset_repo_id your/dataset \
+        --num_trajectories 5 \
+        --forward_flow_ratios 0.0 0.2 0.4 0.6 0.8 1.0
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+import zarr
+from torch import Tensor
+
+# Add SplatSim to path if needed
+splatsim_path = Path.home() / "code" / "SplatSim"
+if str(splatsim_path) not in sys.path:
+    sys.path.insert(0, str(splatsim_path))
+
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.pi05.processor_pi05 import make_pi05_inverse_post_processor
+from lerobot.processor import PolicyAction
+from lerobot.processor.rename_processor import rename_stats
+from lerobot.processor.core import TransitionKey
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.pi05 import SharedAutonomyConfig
+
+
+class TrajectoryLoader:
+    """Loads trajectories from zarr database."""
+
+    def __init__(self, traj_folder: str):
+        """Load trajectory database.
+
+        Args:
+            traj_folder: Path to .zarr trajectory folder
+        """
+        assert traj_folder.endswith('.zarr'), "Currently only .zarr trajectory folder is supported."
+
+        self.scenarios_groups = zarr.open(traj_folder, mode='r')['trajectories']
+        self.trajectories = self._load_trajectory_list()
+
+        print(f"Loaded {len(self.trajectories)} trajectories from {traj_folder}")
+
+    def _load_trajectory_list(self):
+        """Parse zarr structure and extract trajectory list."""
+        scenario_re = re.compile(r"^scenario_(\d+)$")
+        existing_ids = []
+
+        for name in self.scenarios_groups.keys():
+            m = scenario_re.match(name)
+            if m:
+                existing_ids.append(int(m.group(1)))
+
+        existing_ids.sort()
+        trajectories = []
+
+        for scenario_id in existing_ids:
+            scenario_name = f'scenario_{scenario_id:04d}'
+            scenarios_group = self.scenarios_groups[scenario_name]
+
+            obstacle_re = re.compile(r"^obstacle_config_(\d+)$")
+            for obstacle_name in scenarios_group.keys():
+                if obstacle_re.match(obstacle_name):
+                    obstacle_config = scenarios_group[obstacle_name]
+                    obstacle_config_json = json.loads(obstacle_config.attrs['metadata'])
+
+                    traj_re = re.compile(r"^traj_(\d+)$")
+                    for trajs_name in obstacle_config.keys():
+                        if traj_re.match(trajs_name):
+                            traj_group = obstacle_config[trajs_name]
+                            qs = np.array(traj_group['qs'])
+
+                            trajectories.append({
+                                "qs": qs,
+                                "metadata": obstacle_config_json,
+                                "name": f"{scenario_name}_{obstacle_name}_{trajs_name}",
+                                "zarr_group": traj_group,
+                            })
+
+        return trajectories
+
+    def get_trajectory(self, idx: int):
+        """Get trajectory by index."""
+        return self.trajectories[idx]
+
+    def __len__(self):
+        return len(self.trajectories)
+
+
+class SharedAutonomyTester:
+    """Test shared autonomy with trajectory-based human input.
+
+    This class properly loads the policy with preprocessors/postprocessors
+    following the lerobot_record.py pattern.
+    """
+
+    def __init__(
+        self,
+        policy_path: str,
+        dataset_repo_id: str,
+        traj_folder: str,
+        device: str = "cuda",
+        task_description: str = "obstacle avoidance in scenario_0000",
+    ):
+        """Initialize tester with policy and trajectory loader.
+
+        Args:
+            policy_path: Path to pretrained PI0.5 model
+            dataset_repo_id: Dataset repo ID for loading metadata/stats
+            traj_folder: Path to trajectory zarr folder
+            device: Device to run policy on
+            task_description: Language task description (placeholder for testing)
+        """
+        self.device = device
+        self.policy_path = policy_path
+        self.dataset_repo_id = dataset_repo_id
+
+        # Load trajectory database
+        print(f"Loading trajectories from {traj_folder}...")
+        self.traj_loader = TrajectoryLoader(traj_folder)
+
+        # Load dataset metadata (needed for policy initialization)
+        print(f"Loading dataset metadata from {dataset_repo_id}...")
+        self.dataset_meta = LeRobotDatasetMetadata(dataset_repo_id)
+
+        # Store task description (will be tokenized by PI05 preprocessor)
+        print(f"Task description: '{task_description}'")
+        self.task_description = task_description
+
+        # Load policy with proper preprocessing/postprocessing
+        print(f"Loading policy from {policy_path}...")
+        self._load_policy()
+
+        print("Initialization complete!")
+
+    def _load_policy(self):
+        """Load policy following lerobot_record.py pattern.
+
+        This ensures proper preprocessors/postprocessors are created.
+        """
+        # Load policy config from pretrained path
+        policy_config = PreTrainedConfig.from_pretrained(self.policy_path)
+        policy_config.pretrained_path = Path(self.policy_path)
+        policy_config.device = self.device
+
+        # Create policy
+        self.policy = make_policy(policy_config, ds_meta=self.dataset_meta)
+
+        # Create preprocessors and postprocessors
+        # This is critical - same pattern as lerobot_record.py line 472-480
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            policy_cfg=policy_config,
+            pretrained_path=policy_config.pretrained_path,
+            dataset_stats=rename_stats(self.dataset_meta.stats, {}),  # No rename map
+            preprocessor_overrides={
+                "device_processor": {"device": policy_config.device},
+            },
+        )
+
+        # Create inverse postprocessor to normalize human actions
+        # CRITICAL: Must use the SAME stats as the postprocessor for the round-trip to work!
+        # The postprocessor is loaded from pretrained, so we extract its stats rather than
+        # using trajectory stats which would break the normalization round-trip.
+        # Extract stats from the loaded postprocessor
+        postprocessor_stats = None
+        for step in self.postprocessor.steps:
+            if hasattr(step, 'stats') and step.stats is not None:
+                postprocessor_stats = step.stats
+                break
+
+        self.inverse_postprocessor, = make_pi05_inverse_post_processor(
+            config=policy_config,
+            dataset_stats=postprocessor_stats,  # Use same stats as postprocessor!
+        )
+
+        # Set policy to eval mode
+        self.policy.eval()
+
+        print(f"  Policy type: {policy_config.__class__.__name__}")
+        print(f"  Device: {self.device}")
+        print(f"  Preprocessor steps: {len(self.preprocessor.steps) if self.preprocessor else 0}")
+        print(f"  Postprocessor steps: {len(self.postprocessor.steps) if self.postprocessor else 0}")
+
+    def enable_shared_autonomy(self, forward_flow_ratio: float):
+        """Enable shared autonomy with specified forward_flow_ratio.
+
+        Args:
+            forward_flow_ratio: Blending ratio (0.0 = pure human, 1.0 = pure policy)
+        """
+        sa_config = SharedAutonomyConfig(
+            enabled=True,
+            forward_flow_ratio=forward_flow_ratio,
+            human_action_buffer_size=1,
+        )
+
+        self.policy.config.shared_autonomy_config = sa_config
+        self.policy.init_shared_autonomy_processor()
+
+        print(f"Shared autonomy enabled with forward_flow_ratio={forward_flow_ratio}")
+
+    def disable_shared_autonomy(self):
+        """Disable shared autonomy."""
+        self.policy.config.shared_autonomy_config = None
+        self.policy.sa_processor = None
+        print("Shared autonomy disabled")
+
+    def get_dummy_observation(self) -> dict:
+        """Create dummy observation matching dataset format.
+
+        In a real scenario, this would come from the robot/environment.
+        For testing, we create a placeholder observation.
+
+        Returns:
+            Dictionary with observation keys matching policy expectations
+        """
+        # Get observation keys from dataset metadata
+        obs_dict = {}
+
+        # Add image observations
+        for key, feature_info in self.dataset_meta.features.items():
+            if feature_info.get("dtype") in ["image", "video"]:
+                # Create dummy image [C, H, W]
+                obs_dict[key] = torch.randn(3, 224, 224, device=self.device)
+
+        # Add state observations
+        for key, feature_info in self.dataset_meta.features.items():
+            if "state" in key.lower() and feature_info.get("dtype") not in ["image", "video"]:
+                # Get state dim from metadata
+                state_shape = feature_info.get("shape", [32])
+                state_dim = state_shape[0] if isinstance(state_shape, (list, tuple)) else state_shape
+                obs_dict[key] = torch.randn(state_dim, device=self.device)
+
+        # Add batch dimension for observations
+        for key in obs_dict:
+            obs_dict[key] = obs_dict[key].unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
+
+        # Add task description as top-level key (batch_to_transition will move it to complementary_data)
+        obs_dict["task"] = [self.task_description]  # List with batch size 1
+
+        return obs_dict
+
+    def predict_action(
+        self,
+        observation: dict,
+        human_action: Optional[Tensor] = None,
+    ) -> PolicyAction:
+        """Predict action with optional human input.
+
+        This follows the same pattern as lerobot_record.py's predict_action function.
+
+        Args:
+            observation: Dictionary of observations
+            human_action: Optional human action tensor for shared autonomy
+
+        Returns:
+            PolicyAction dictionary
+        """
+        # Preprocess observation
+        if self.preprocessor is not None:
+            observation = self.preprocessor(observation)
+
+        initial_human_action = human_action.clone()
+
+        # Provide human action if shared autonomy is enabled
+        if human_action is not None and self.policy.sa_processor is not None:
+            if not isinstance(human_action, Tensor):
+                human_action = torch.tensor(human_action, dtype=torch.float32, device=self.device)
+            
+            # human_action shape: [batch, timesteps, action_dim] or [batch, action_dim]
+            batch_size = human_action.shape[0]
+            num_timesteps = human_action.shape[1] if human_action.ndim == 3 else 1
+            action_dim = human_action.shape[-1]
+            
+            # Reshape to [batch*timesteps, action_dim] for normalization
+            human_action_flat = human_action.reshape(-1, action_dim)
+            
+            # Normalize each timestep using inverse_postprocessor
+            # (inverse_postprocessor: unnormalized -> normalized)
+            human_action_normalized = self.inverse_postprocessor(human_action_flat)
+            
+            # Reshape back to [batch, timesteps, action_dim]
+            human_action = human_action_normalized.reshape(batch_size, num_timesteps, -1)
+            
+            # Pad the human action to chunk_size if needed. Repeat the last action until you reach chunk_size.
+            if human_action.shape[1] < self.policy.config.chunk_size:
+                padding = torch.tile(
+                    human_action[:, -1:, :],
+                    (1, self.policy.config.chunk_size - human_action.shape[1], 1)
+                )
+                human_action = torch.cat([human_action, padding], axis=1)  # [batch, chunk_size, action_dim]
+
+            max_action_dim = self.policy.config.max_action_dim
+            if human_action.shape[-1] < max_action_dim:
+                chunk_size = self.policy.config.chunk_size
+                padding = torch.zeros((batch_size, chunk_size, max_action_dim - human_action.shape[-1])).to(human_action.device)
+                human_action = torch.cat([human_action, padding], axis=2)  # [batch, chunk_size, max_action_dim]
+
+            self.policy.set_human_action(human_action)
+
+        # Get policy action
+        with torch.no_grad():
+            policy_action = self.policy.select_action(observation)
+
+        # import pdb; pdb.set_trace()
+
+        # Postprocess action
+        if self.postprocessor is not None:
+            policy_action = self.postprocessor(policy_action)
+        # import pdb; pdb.set_trace()
+
+        return policy_action
+
+    def test_trajectory(
+        self,
+        traj_idx: int,
+        forward_flow_ratio: float,
+        max_steps: Optional[int] = None,
+    ) -> dict:
+        """Test a single trajectory with shared autonomy.
+
+        Args:
+            traj_idx: Trajectory index to test
+            forward_flow_ratio: Blending ratio
+            max_steps: Maximum number of steps to test (None = full trajectory)
+
+        Returns:
+            Dictionary with results
+        """
+        # Get trajectory
+        traj_data = self.traj_loader.get_trajectory(traj_idx)
+        traj_name = traj_data["name"]
+        trajectory_qs = traj_data["qs"]  # [T, action_dim]
+
+        self.policy.reset()
+
+        print(f"\nTesting trajectory: {traj_name}")
+        print(f"  Length: {len(trajectory_qs)} steps")
+        print(f"  Forward flow ratio: {forward_flow_ratio}")
+
+        # Limit steps if specified
+        T = min(len(trajectory_qs), max_steps) if max_steps else len(trajectory_qs)
+
+        # Storage
+        human_actions = []
+        policy_actions = []
+
+        # Get dummy observation
+        obs = self.get_dummy_observation()
+
+        chunk_size = self.policy.config.chunk_size
+
+        # Step through trajectory
+        for t in range(T):
+            # Get human action from trajectory
+            human_action_np = trajectory_qs[t : t + chunk_size]  # [prediction horizon, action_dim]
+
+            # Pad 6-DOF to 7-DOF (add gripper value at index 6)
+            if human_action_np.shape[1] == 6:
+                # Add gripper dimension (default to 0 = gripper open)
+                human_action_np = np.insert(human_action_np, 6, 0.0, axis=1)
+
+            # Convert to tensor with batch dimension
+            human_action_tensor = torch.tensor(
+                human_action_np,
+                dtype=torch.float32,
+                device=self.device,
+            ).unsqueeze(0)  # [1, 50, 7]
+
+            # Predict with shared autonomy
+            policy_action = self.predict_action(obs, human_action_tensor)
+
+            # Extract action (policy_action is a dict with 'action' key)
+            policy_action_np = policy_action.cpu().numpy()[0]
+
+            # Store (use 7-DOF for comparison, policy output is also 7-DOF after postprocessing)
+            human_actions.append(human_action_np[0, :7])  # Take only first 7 dims of the current timestep
+            policy_actions.append(policy_action_np[:7])  # Take only first 7 dims
+
+        # Convert to arrays
+        human_actions = np.array(human_actions)
+        policy_actions = np.array(policy_actions)
+
+        # Compute metrics
+        deviation = np.linalg.norm(policy_actions - human_actions, axis=1)
+        metrics = {
+            "mean_deviation": float(deviation.mean()),
+            "std_deviation": float(deviation.std()),
+            "max_deviation": float(deviation.max()),
+            "min_deviation": float(deviation.min()),
+        }
+
+        print(f"  Mean deviation: {metrics['mean_deviation']:.4f}")
+
+        return {
+            "traj_name": traj_name,
+            "forward_flow_ratio": forward_flow_ratio,
+            "num_steps": T,
+            "metrics": metrics,
+            "human_actions": human_actions,
+            "policy_actions": policy_actions,
+        }
+
+    def test_multiple_ratios(
+        self,
+        traj_idx: int,
+        forward_flow_ratios: list[float],
+        max_steps: Optional[int] = None,
+    ) -> dict:
+        """Test trajectory with multiple forward_flow_ratio values.
+
+        Args:
+            traj_idx: Trajectory index
+            forward_flow_ratios: List of ratios to test
+            max_steps: Maximum steps per test
+
+        Returns:
+            Dictionary with results for all ratios
+        """
+        results = {}
+
+        for ratio in forward_flow_ratios:
+            # Enable shared autonomy with this ratio
+            self.enable_shared_autonomy(ratio)
+
+            # Test trajectory
+            result = self.test_trajectory(traj_idx, ratio, max_steps)
+            results[ratio] = result
+
+        return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Test shared autonomy with trajectory database"
+    )
+    parser.add_argument(
+        "--policy_path",
+        type=str,
+        required=True,
+        help="Path to pretrained PI0.5 model",
+    )
+    parser.add_argument(
+        "--dataset_repo_id",
+        type=str,
+        required=True,
+        help="Dataset repo ID (for loading metadata/stats)",
+    )
+    parser.add_argument(
+        "--traj_folder",
+        type=str,
+        required=True,
+        help="Path to zarr trajectory folder",
+    )
+    parser.add_argument(
+        "--num_trajectories",
+        type=int,
+        default=3,
+        help="Number of trajectories to test",
+    )
+    parser.add_argument(
+        "--forward_flow_ratios",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        help="Forward flow ratios to test",
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="Maximum steps per trajectory (None = full trajectory)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to run on",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="output/shared_autonomy_tests",
+        help="Output directory for results",
+    )
+    parser.add_argument(
+        "--task_description",
+        type=str,
+        default="obstacle avoidance in scenario_0000",
+        help="Language task description (placeholder for testing)",
+    )
+
+    args = parser.parse_args()
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    print("="*80)
+    print("SHARED AUTONOMY TESTING WITH TRAJECTORY DATABASE")
+    print("="*80)
+
+    # Initialize tester
+    tester = SharedAutonomyTester(
+        policy_path=args.policy_path,
+        dataset_repo_id=args.dataset_repo_id,
+        traj_folder=args.traj_folder,
+        device=args.device,
+        task_description=args.task_description,
+    )
+
+    # Test multiple trajectories
+    all_results = []
+
+    for traj_idx in range(min(args.num_trajectories, len(tester.traj_loader))):
+        print(f"\n{'='*80}")
+        print(f"TRAJECTORY {traj_idx + 1}/{args.num_trajectories}")
+        print(f"{'='*80}")
+
+        results = tester.test_multiple_ratios(
+            traj_idx=traj_idx,
+            forward_flow_ratios=args.forward_flow_ratios,
+            max_steps=args.max_steps,
+        )
+
+        all_results.append(results)
+
+    # Save results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = os.path.join(
+        args.output_dir,
+        f"shared_autonomy_results_{timestamp}.json"
+    )
+
+    # Prepare for JSON (convert numpy arrays to lists)
+    results_json = []
+    for traj_results in all_results:
+        traj_json = {}
+        for ratio, result in traj_results.items():
+            traj_json[str(ratio)] = {
+                "traj_name": result["traj_name"],
+                "num_steps": result["num_steps"],
+                "metrics": result["metrics"],
+            }
+        results_json.append(traj_json)
+
+    with open(output_file, 'w') as f:
+        json.dump(results_json, f, indent=2)
+
+    print(f"\n{'='*80}")
+    print(f"Results saved to: {output_file}")
+    print(f"{'='*80}")
+
+
+if __name__ == "__main__":
+    main()

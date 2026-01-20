@@ -68,6 +68,7 @@ def euler_integrate(
     inference_delay: int | None = None,
     prev_chunk_left_over: Tensor | None = None,
     execution_horizon: int | None = None,
+    t_start: float = 1.0,
 ) -> Tensor:
     """Forward-Euler integration of a velocity field from t=1 (noise) to t=0 (actions).
 
@@ -89,14 +90,18 @@ def euler_integrate(
         inference_delay: RTC guidance parameter, forwarded verbatim.
         prev_chunk_left_over: RTC guidance parameter, forwarded verbatim.
         execution_horizon: RTC guidance parameter, forwarded verbatim.
+        t_start: Time to start integrating from. Defaults to 1.0 (pure noise).
+            Shared autonomy sets this below 1.0 to preserve a partial forward
+            flow already applied to ``noise`` — integration then runs from
+            ``t_start`` to 0 over the same ``num_steps``.
     """
     bsize = noise.shape[0]
     device = noise.device
 
-    dt = -1.0 / num_steps
+    dt = -t_start / num_steps
     x_t = noise
     for step in range(num_steps):
-        time = 1.0 + step * dt
+        time = t_start + step * dt
         time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
         def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):

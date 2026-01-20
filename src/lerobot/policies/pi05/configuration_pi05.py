@@ -21,6 +21,7 @@ from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 from ..rtc.configuration_rtc import RTCConfig
+from .configuration_shared_autonomy import SharedAutonomyConfig
 
 DEFAULT_IMAGE_SIZE = 224
 
@@ -58,6 +59,9 @@ class PI05Config(PreTrainedConfig):
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
+
+    # Shared Autonomy configuration
+    shared_autonomy_config: SharedAutonomyConfig | None = None
 
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,

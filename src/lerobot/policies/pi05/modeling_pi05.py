@@ -63,6 +63,7 @@ from ..common.vla_utils import (
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from .modeling_shared_autonomy import SharedAutonomyProcessor
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -401,10 +402,16 @@ class PaliGemmaWithExpertModel(
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI05 PyTorch model."""
 
-    def __init__(self, config: PI05Config, rtc_processor: RTCProcessor | None = None):
+    def __init__(
+        self,
+        config: PI05Config,
+        rtc_processor: RTCProcessor | None = None,
+        sa_processor: SharedAutonomyProcessor | None = None,
+    ):
         super().__init__()
         self.config = config
         self.rtc_processor = rtc_processor
+        self.sa_processor = sa_processor
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
@@ -652,6 +659,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             use_cache=True,
         )
 
+        # Shared autonomy: seed the sample with a partial forward flow of the
+        # human action and start integrating from t_sw instead of t=1. Falls
+        # through to the standard full-noise path when no human action is set.
+        t_start = 1.0
+        if self.sa_processor is not None and self.sa_processor.has_human_action():
+            human_action = self.sa_processor.get_human_action()
+            if human_action.device != device:
+                human_action = human_action.to(device)
+            noise = self.sa_processor.compute_initial_state(noise, human_action)
+            t_start, _dt, num_steps = self.sa_processor.modify_denoising_params(num_steps)
+
         return euler_integrate(
             lambda input_x_t, current_timestep: self.denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
@@ -666,6 +684,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inference_delay=kwargs.get("inference_delay"),
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
+            t_start=t_start,
         )
 
     def denoise_step(
@@ -731,9 +750,14 @@ class PI05Policy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        # Initialize the core PI05 model
+        # Initialize processors
         self.init_rtc_processor()
-        self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+        self.init_shared_autonomy_processor()
+
+        # Initialize the core PI05 model
+        self.model = PI05Pytorch(
+            config, rtc_processor=self.rtc_processor, sa_processor=self.sa_processor
+        )
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -948,6 +972,42 @@ class PI05Policy(PreTrainedPolicy):
 
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def init_shared_autonomy_processor(self):
+        """Initialize Shared Autonomy processor if enabled in config."""
+        self.sa_processor = None
+
+        # Create processor if config provided
+        if self.config.shared_autonomy_config is not None:
+            self.sa_processor = SharedAutonomyProcessor(self.config.shared_autonomy_config)
+
+            model_value = getattr(self, "model", None)
+            if model_value is not None:
+                model_value.sa_processor = self.sa_processor
+
+    def _sa_enabled(self) -> bool:
+        """Check if shared autonomy is enabled."""
+        return (
+            self.config.shared_autonomy_config is not None
+            and self.config.shared_autonomy_config.enabled
+        )
+
+    def set_human_action(self, human_action: Tensor):
+        """Public API to provide human action input.
+
+        Args:
+            human_action: Human-provided action tensor.
+                Shape: [B, action_dim] or [B, chunk_size, action_dim]
+
+        Raises:
+            RuntimeError: If shared autonomy is not enabled in config.
+        """
+        if self.sa_processor is not None:
+            self.sa_processor.set_human_action(human_action)
+        else:
+            raise RuntimeError(
+                "Shared autonomy is not enabled. Set config.shared_autonomy_config to enable."
+            )
 
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
