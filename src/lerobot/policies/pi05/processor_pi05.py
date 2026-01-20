@@ -169,3 +169,50 @@ def make_pi05_pre_post_processors(
             to_output=transition_to_policy_action,
         ),
     )
+
+def make_pi05_inverse_post_processor(
+    config: PI05Config,
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+) -> tuple[
+    PolicyProcessorPipeline[PolicyAction, PolicyAction],
+]:
+    """
+    Constructs the inverse post-processor pipeline for PI0.5.
+
+    This pipeline inverts the postprocessor by:
+    1. Normalizing the output features (inverse of unnormalizing).
+    2. Moving data to the compute device (inverse of moving to CPU).
+
+    This is used to prepare human actions for shared autonomy by converting them
+    from the unnormalized space back to the normalized space expected by the policy.
+
+    Args:
+        config: The configuration object for the PI0.5 policy.
+        dataset_stats: A dictionary of statistics for normalization.
+
+    Returns:
+        A tuple containing the configured inverse post-processor pipeline.
+    """
+    # Inverse of postprocessor:
+    # postprocessor: normalize → unnormalize, move to CPU
+    # inverse: unnormalize → normalize, move to device
+    # So we reverse the order and apply inverses
+    inverse_steps: list[ProcessorStep] = [
+        # First normalize (inverse of unnormalize)
+        NormalizerProcessorStep(
+            features=config.output_features,
+            norm_map=config.normalization_mapping,
+            stats=dataset_stats,
+        ),
+        # Then move to compute device (inverse of moving to CPU)
+        DeviceProcessorStep(device=config.device),
+    ]
+
+    return (
+        PolicyProcessorPipeline[PolicyAction, PolicyAction](
+            steps=inverse_steps,
+            name="inverse_postprocessor",
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
+        ),
+    )

@@ -15,7 +15,15 @@
 # limitations under the License.
 
 from .configuration_pi05 import PI05Config
+from .configuration_shared_autonomy import SharedAutonomyConfig
 from .modeling_pi05 import PI05Policy
+from .modeling_shared_autonomy import SharedAutonomyProcessor
 from .processor_pi05 import make_pi05_pre_post_processors
 
-__all__ = ["PI05Config", "PI05Policy", "make_pi05_pre_post_processors"]
+__all__ = [
+    "PI05Config",
+    "SharedAutonomyConfig",
+    "PI05Policy",
+    "SharedAutonomyProcessor",
+    "make_pi05_pre_post_processors",
+]
