@@ -1,0 +1,312 @@
+[
+  {
+    "0.0": {
+      "traj_name": "scenario_0000_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 0.8976306915283203,
+        "std_deviation": 0.2764987051486969,
+        "max_deviation": 1.4009497165679932,
+        "min_deviation": 0.48082128167152405
+      }
+    },
+    "0.2": {
+      "traj_name": "scenario_0000_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.4344074726104736,
+        "std_deviation": 1.0608536005020142,
+        "max_deviation": 3.658191442489624,
+        "min_deviation": 0.6036171913146973
+      }
+    },
+    "0.4": {
+      "traj_name": "scenario_0000_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.110466718673706,
+        "std_deviation": 0.7940003275871277,
+        "max_deviation": 3.612926721572876,
+        "min_deviation": 0.23149201273918152
+      }
+    },
+    "0.6": {
+      "traj_name": "scenario_0000_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.666125774383545,
+        "std_deviation": 1.0992103815078735,
+        "max_deviation": 3.5910024642944336,
+        "min_deviation": 0.38220250606536865
+      }
+    },
+    "0.8": {
+      "traj_name": "scenario_0000_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.8730987310409546,
+        "std_deviation": 0.6594607830047607,
+        "max_deviation": 3.360210657119751,
+        "min_deviation": 1.2384843826293945
+      }
+    },
+    "1.0": {
+      "traj_name": "scenario_0000_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 3.744978904724121,
+        "std_deviation": 0.7274933457374573,
+        "max_deviation": 5.332914352416992,
+        "min_deviation": 2.5461249351501465
+      }
+    }
+  },
+  {
+    "0.0": {
+      "traj_name": "scenario_0001_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 0.8836390376091003,
+        "std_deviation": 0.6396064758300781,
+        "max_deviation": 2.256075382232666,
+        "min_deviation": 0.3806565999984741
+      }
+    },
+    "0.2": {
+      "traj_name": "scenario_0001_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 0.8567309975624084,
+        "std_deviation": 0.7534403800964355,
+        "max_deviation": 3.4047458171844482,
+        "min_deviation": 0.3472406268119812
+      }
+    },
+    "0.4": {
+      "traj_name": "scenario_0001_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.3643163442611694,
+        "std_deviation": 1.0248477458953857,
+        "max_deviation": 3.3862757682800293,
+        "min_deviation": 0.16579830646514893
+      }
+    },
+    "0.6": {
+      "traj_name": "scenario_0001_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.3377684354782104,
+        "std_deviation": 0.6975591778755188,
+        "max_deviation": 3.13670015335083,
+        "min_deviation": 0.8613202571868896
+      }
+    },
+    "0.8": {
+      "traj_name": "scenario_0001_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 0.9100412726402283,
+        "std_deviation": 0.23902685940265656,
+        "max_deviation": 1.7407809495925903,
+        "min_deviation": 0.6830041408538818
+      }
+    },
+    "1.0": {
+      "traj_name": "scenario_0001_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 2.583897352218628,
+        "std_deviation": 0.27553677558898926,
+        "max_deviation": 3.318822145462036,
+        "min_deviation": 2.1072306632995605
+      }
+    }
+  },
+  {
+    "0.0": {
+      "traj_name": "scenario_0002_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 0.9434834718704224,
+        "std_deviation": 0.7412017583847046,
+        "max_deviation": 3.4742252826690674,
+        "min_deviation": 0.48082128167152405
+      }
+    },
+    "0.2": {
+      "traj_name": "scenario_0002_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.1575793027877808,
+        "std_deviation": 0.6913884878158569,
+        "max_deviation": 2.4603703022003174,
+        "min_deviation": 0.5545187592506409
+      }
+    },
+    "0.4": {
+      "traj_name": "scenario_0002_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.1764600276947021,
+        "std_deviation": 0.5578014254570007,
+        "max_deviation": 2.48506236076355,
+        "min_deviation": 0.7398114204406738
+      }
+    },
+    "0.6": {
+      "traj_name": "scenario_0002_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.239122986793518,
+        "std_deviation": 0.21763339638710022,
+        "max_deviation": 1.4709112644195557,
+        "min_deviation": 0.6948227882385254
+      }
+    },
+    "0.8": {
+      "traj_name": "scenario_0002_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.7418304681777954,
+        "std_deviation": 0.6320816874504089,
+        "max_deviation": 2.796391487121582,
+        "min_deviation": 0.9421190619468689
+      }
+    },
+    "1.0": {
+      "traj_name": "scenario_0002_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 3.2767837047576904,
+        "std_deviation": 0.549089252948761,
+        "max_deviation": 4.402959823608398,
+        "min_deviation": 2.1307666301727295
+      }
+    }
+  },
+  {
+    "0.0": {
+      "traj_name": "scenario_0003_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.1630758047103882,
+        "std_deviation": 0.7238413095474243,
+        "max_deviation": 2.587461233139038,
+        "min_deviation": 0.48082128167152405
+      }
+    },
+    "0.2": {
+      "traj_name": "scenario_0003_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.212642788887024,
+        "std_deviation": 0.9083979725837708,
+        "max_deviation": 3.4826576709747314,
+        "min_deviation": 0.6427313685417175
+      }
+    },
+    "0.4": {
+      "traj_name": "scenario_0003_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 0.8010967373847961,
+        "std_deviation": 0.20360514521598816,
+        "max_deviation": 1.0699609518051147,
+        "min_deviation": 0.5093637108802795
+      }
+    },
+    "0.6": {
+      "traj_name": "scenario_0003_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.5620925426483154,
+        "std_deviation": 0.9151856899261475,
+        "max_deviation": 3.406198263168335,
+        "min_deviation": 0.7089687585830688
+      }
+    },
+    "0.8": {
+      "traj_name": "scenario_0003_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.8665695190429688,
+        "std_deviation": 0.6883613467216492,
+        "max_deviation": 3.6514127254486084,
+        "min_deviation": 0.9790455102920532
+      }
+    },
+    "1.0": {
+      "traj_name": "scenario_0003_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 3.762799024581909,
+        "std_deviation": 0.676512598991394,
+        "max_deviation": 4.917195796966553,
+        "min_deviation": 2.6745975017547607
+      }
+    }
+  },
+  {
+    "0.0": {
+      "traj_name": "scenario_0004_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.1544158458709717,
+        "std_deviation": 1.391270637512207,
+        "max_deviation": 4.76230525970459,
+        "min_deviation": 0.34504061937332153
+      }
+    },
+    "0.2": {
+      "traj_name": "scenario_0004_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 0.6638965606689453,
+        "std_deviation": 0.24347248673439026,
+        "max_deviation": 1.2227897644042969,
+        "min_deviation": 0.27360448241233826
+      }
+    },
+    "0.4": {
+      "traj_name": "scenario_0004_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.4945040941238403,
+        "std_deviation": 1.3420512676239014,
+        "max_deviation": 4.328152656555176,
+        "min_deviation": 0.48174968361854553
+      }
+    },
+    "0.6": {
+      "traj_name": "scenario_0004_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.0605502128601074,
+        "std_deviation": 0.8709589242935181,
+        "max_deviation": 4.1084747314453125,
+        "min_deviation": 0.5213558077812195
+      }
+    },
+    "0.8": {
+      "traj_name": "scenario_0004_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 2.0179970264434814,
+        "std_deviation": 1.1255918741226196,
+        "max_deviation": 4.450100421905518,
+        "min_deviation": 0.7826111912727356
+      }
+    },
+    "1.0": {
+      "traj_name": "scenario_0004_obstacle_config_00_traj_00",
+      "num_steps": 120,
+      "metrics": {
+        "mean_deviation": 1.7283165454864502,
+        "std_deviation": 0.9338571429252625,
+        "max_deviation": 3.924381971359253,
+        "min_deviation": 0.606906533241272
+      }
+    }
+  }
+]
