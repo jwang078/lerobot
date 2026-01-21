@@ -25,14 +25,29 @@ Features:
 - Tests multiple forward_flow_ratios to blend human and policy actions
 - Computes deviation metrics between human and policy trajectories
 - Optionally saves policy trajectories back to zarr format with auto-incrementing
+- Supports both offline testing (dummy observations) and online testing (real robot)
+- Real robot mode gets observations from SplatSim and sends actions back
 
-Usage (basic testing):
+Usage (offline testing with dummy observations):
     python examples/test_shared_autonomy_with_trajectories.py \
         --policy_path /path/to/pi05/model \
         --traj_folder /path/to/trajectories.zarr \
         --dataset_repo_id your/dataset \
         --num_trajectories 5 \
         --forward_flow_ratios 0.0 0.2 0.4 0.6 0.8 1.0
+
+Usage (online testing with real robot):
+    python examples/test_shared_autonomy_with_trajectories.py \
+        --policy_path /path/to/pi05/model \
+        --traj_folder /path/to/trajectories.zarr \
+        --dataset_repo_id your/dataset \
+        --num_trajectories 5 \
+        --forward_flow_ratios 0.0 0.2 0.4 0.6 0.8 1.0 \
+        --use_robot \
+        --robot_hostname 127.0.0.1 \
+        --robot_port 6001 \
+        --base_camera_port 5001 \
+        --control_rate_hz 50
 
 Usage (with trajectory saving):
     python examples/test_shared_autonomy_with_trajectories.py \
@@ -41,6 +56,7 @@ Usage (with trajectory saving):
         --dataset_repo_id your/dataset \
         --num_trajectories 5 \
         --forward_flow_ratios 0.0 0.2 0.4 0.6 0.8 1.0 \
+        --use_robot \
         --save_trajectories \
         --save_ratios 0.4 0.6 0.8 \
         --output_suffix _sapi05
@@ -48,6 +64,9 @@ Usage (with trajectory saving):
 The output zarr folder will have the same structure as input with suffix added.
 For example: trajectories.zarr -> trajectories_sapi05.zarr
 Trajectories are auto-incremented within each scenario/obstacle_config group.
+
+Note: When using --use_robot, make sure the SplatSim server is running and accessible
+at the specified hostname/port (matching lerobot-record connection parameters).
 """
 
 import argparse
@@ -58,11 +77,14 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+import time
 
 import numpy as np
 import torch
 import zarr
 from torch import Tensor
+from scipy.interpolate import interp1d
+
 
 # Add SplatSim to path if needed
 splatsim_path = Path.home() / "code" / "SplatSim"
@@ -282,8 +304,15 @@ class SharedAutonomyTester:
         policy_path: str,
         dataset_repo_id: str,
         traj_folder: str,
+        traj_replay_speed: float = 1.0,
         device: str = "cuda",
         task_description: str = "obstacle avoidance in scenario_0000",
+        use_robot: bool = False,
+        robot_hostname: str = "127.0.0.1",
+        robot_port: int = 6001,
+        base_camera_port: int = 5001,
+        control_rate_hz: int = 50,
+        n_action_steps: Optional[int] = 10,
     ):
         """Initialize tester with policy and trajectory loader.
 
@@ -293,10 +322,21 @@ class SharedAutonomyTester:
             traj_folder: Path to trajectory zarr folder
             device: Device to run policy on
             task_description: Language task description (placeholder for testing)
+            use_robot: Whether to connect to real robot for observations
+            robot_hostname: Robot IP address (if use_robot=True)
+            robot_port: Robot ZMQ port (if use_robot=True)
+            base_camera_port: Base camera port (if use_robot=True)
+            control_rate_hz: Robot control rate (if use_robot=True)
+            n_action_steps: Number of actions to execute from each chunk (None=use config default)
+                Lower values create more overlap and smoother motion (e.g., 10 with chunk_size=50)
         """
         self.device = device
         self.policy_path = policy_path
         self.dataset_repo_id = dataset_repo_id
+        self.use_robot = use_robot
+        self.robot = None
+        self.n_action_steps_override = n_action_steps
+        self.traj_replay_speed = traj_replay_speed
 
         # Load trajectory database
         print(f"Loading trajectories from {traj_folder}...")
@@ -310,11 +350,48 @@ class SharedAutonomyTester:
         print(f"Task description: '{task_description}'")
         self.task_description = task_description
 
+        # Connect to robot if requested
+        if use_robot:
+            print(f"\nConnecting to SplatSim robot at {robot_hostname}:{robot_port}...")
+            self._connect_robot(robot_hostname, robot_port, base_camera_port, control_rate_hz)
+
         # Load policy with proper preprocessing/postprocessing
         print(f"Loading policy from {policy_path}...")
         self._load_policy()
 
         print("Initialization complete!")
+
+    def _connect_robot(
+        self,
+        hostname: str,
+        robot_port: int,
+        base_camera_port: int,
+        control_rate_hz: int,
+    ):
+        """Connect to SplatSim robot.
+
+        Args:
+            hostname: Robot IP address
+            robot_port: Robot ZMQ port
+            base_camera_port: Base camera port
+            control_rate_hz: Control rate
+        """
+        from lerobot.robots.splatsim_lerobot import SplatSimLerobot, SplatSimLerobotConfig
+
+        # Create robot config
+        robot_config = SplatSimLerobotConfig(
+            hostname=hostname,
+            robot_port=robot_port,
+            base_camera_port=base_camera_port,
+            control_rate_hz=control_rate_hz,
+            use_wrist_camera=False,  # Match your dataset
+        )
+
+        # Create and connect robot
+        self.robot = SplatSimLerobot(robot_config)
+        self.robot.connect()
+
+        print(f"  Robot connected successfully!")
 
     def _load_policy(self):
         """Load policy following lerobot_record.py pattern.
@@ -325,6 +402,19 @@ class SharedAutonomyTester:
         policy_config = PreTrainedConfig.from_pretrained(self.policy_path)
         policy_config.pretrained_path = Path(self.policy_path)
         policy_config.device = self.device
+
+        # Reduce n_action_steps to create overlap between chunks for smoother motion
+        # Default: chunk_size=50, n_action_steps=50 (no overlap, jerky at chunk boundaries)
+        # Better: chunk_size=50, n_action_steps=10 (40-step overlap, smooth transitions)
+        if self.n_action_steps_override is not None:
+            if hasattr(policy_config, 'n_action_steps') and hasattr(policy_config, 'chunk_size'):
+                original_n_action_steps = policy_config.n_action_steps
+                policy_config.n_action_steps = min(self.n_action_steps_override, policy_config.chunk_size)
+                if original_n_action_steps != policy_config.n_action_steps:
+                    print(f"  Reducing n_action_steps: {original_n_action_steps} → {policy_config.n_action_steps}")
+                    overlap = policy_config.chunk_size - policy_config.n_action_steps
+                    print(f"    (Creates {overlap}-step overlap between chunks for smoother motion)")
+                    print(f"    (Predicts new chunk every {policy_config.n_action_steps} steps instead of {original_n_action_steps})")
 
         # Create policy
         self.policy = make_policy(policy_config, ds_meta=self.dataset_meta)
@@ -387,11 +477,66 @@ class SharedAutonomyTester:
         self.policy.sa_processor = None
         print("Shared autonomy disabled")
 
-    def get_dummy_observation(self) -> dict:
+    def get_observation(self) -> dict:
+        """Get observation from robot or create dummy observation.
+
+        Returns:
+            Dictionary with observation keys matching policy expectations
+        """
+        if self.use_robot and self.robot is not None:
+            # Get real observation from robot
+            return self._get_robot_observation()
+        else:
+            # Create dummy observation for testing without robot
+            return self._get_dummy_observation()
+
+    def _get_robot_observation(self) -> dict:
+        """Get observation from connected robot.
+
+        Returns:
+            Dictionary with observation keys matching policy expectations
+        """
+        # Get raw observation from robot
+        robot_obs = self.robot.get_observation()
+
+        obs_dict = {}
+
+        # Add images
+        for key, feature_info in self.dataset_meta.features.items():
+            if feature_info.get("dtype") in ["image", "video"]:
+                # Extract camera name from key (e.g., "observation.images.base_rgb" -> "base_rgb")
+                camera_name = key.split(".")[-1]
+                if camera_name in robot_obs:
+                    # Robot returns (H, W, C), convert to (C, H, W) for policy
+                    image = robot_obs[camera_name]
+                    image_chw = np.transpose(image, (2, 0, 1))
+                    # Convert to torch tensor and move to device
+                    obs_dict[key] = torch.from_numpy(image_chw).float().to(self.device)
+
+        # Add state (joint positions)
+        # Robot returns individual joint values, combine into array
+        state_values = []
+        for joint_name in self.robot.config.joint_names:
+            if joint_name in robot_obs:
+                state_values.append(robot_obs[joint_name])
+
+        if state_values:
+            state_array = np.array(state_values, dtype=np.float32)
+            obs_dict["observation.state"] = torch.from_numpy(state_array).to(self.device)
+
+        # Add batch dimension for observations
+        for key in obs_dict:
+            obs_dict[key] = obs_dict[key].unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
+
+        # Add task description as top-level key (batch_to_transition will move it to complementary_data)
+        obs_dict["task"] = [self.task_description]  # List with batch size 1
+
+        return obs_dict
+
+    def _get_dummy_observation(self) -> dict:
         """Create dummy observation matching dataset format.
 
-        In a real scenario, this would come from the robot/environment.
-        For testing, we create a placeholder observation.
+        For testing without robot connection.
 
         Returns:
             Dictionary with observation keys matching policy expectations
@@ -442,9 +587,8 @@ class SharedAutonomyTester:
         if self.preprocessor is not None:
             observation = self.preprocessor(observation)
 
-        initial_human_action = human_action.clone()
-
-        # Provide human action if shared autonomy is enabled
+        # Provide human action if shared autonomy is enabled AND human action is provided
+        # human_action is only provided when the policy's action queue is empty
         if human_action is not None and self.policy.sa_processor is not None:
             if not isinstance(human_action, Tensor):
                 human_action = torch.tensor(human_action, dtype=torch.float32, device=self.device)
@@ -514,6 +658,22 @@ class SharedAutonomyTester:
         traj_name = traj_data["name"]
         trajectory_qs = traj_data["qs"]  # [T, action_dim]
 
+        if self.traj_replay_speed != 1.0:
+            print(f"  Adjusting trajectory replay speed: {self.traj_replay_speed}x")
+            # Adjust timing to match replay speed
+            original_num_timesteps = trajectory_qs.shape[0]
+            target_num_timesteps = int(len(trajectory_qs) / self.traj_replay_speed)
+            # Interpolate trajectory_qs to match target_num_timesteps
+            original_timesteps = np.arange(trajectory_qs.shape[0])
+            target_timesteps = np.linspace(0, trajectory_qs.shape[0] - 1, target_num_timesteps)
+            interpolator = interp1d(original_timesteps, trajectory_qs, axis=0, kind='linear')
+            trajectory_qs = interpolator(target_timesteps)
+
+            if target_num_timesteps < original_num_timesteps:
+                # Pad the end with the last position to maintain original length
+                padding = np.tile(trajectory_qs[-1:], (original_num_timesteps - target_num_timesteps, 1))
+                trajectory_qs = np.vstack([trajectory_qs, padding])
+
         self.policy.reset()
 
         print(f"\nTesting trajectory: {traj_name}")
@@ -527,36 +687,59 @@ class SharedAutonomyTester:
         human_actions = []
         policy_actions = []
 
-        # Get dummy observation
-        obs = self.get_dummy_observation()
-
         chunk_size = self.policy.config.chunk_size
+
+        # Initialize the robot with the starting position if connected
+        if self.use_robot and self.robot is not None:
+            initial_q = trajectory_qs[0]
+            if initial_q.shape[0] == 6:
+                initial_q = np.append(initial_q, 0.0)  # Add gripper
+            for i in range(50):
+                self.robot.send_action(initial_q)
+                time.sleep(0.02)  # Small delay to ensure robot receives initial position
+            self.robot.send_action(initial_q)
+            print("  Sent initial position to robot.")
 
         # Step through trajectory
         for t in range(T):
-            # Get human action from trajectory
-            human_action_np = trajectory_qs[t : t + chunk_size]  # [prediction horizon, action_dim]
+            # Get observation (from robot if connected, otherwise dummy)
+            obs = self.get_observation()
 
-            # Pad 6-DOF to 7-DOF (add gripper value at index 6)
-            if human_action_np.shape[1] == 6:
-                # Add gripper dimension (default to 0 = gripper open)
-                human_action_np = np.insert(human_action_np, 6, 0.0, axis=1)
+            # Only provide human action when policy queue is empty
+            # This prevents re-predicting every timestep and maintains temporal consistency
+            human_action_tensor = None
+            if len(self.policy._action_queue) == 0:
+                # Get human action chunk from trajectory
+                human_action_np = trajectory_qs[t : t + chunk_size]  # [prediction horizon, action_dim]
 
-            # Convert to tensor with batch dimension
-            human_action_tensor = torch.tensor(
-                human_action_np,
-                dtype=torch.float32,
-                device=self.device,
-            ).unsqueeze(0)  # [1, 50, 7]
+                # Pad 6-DOF to 7-DOF (add gripper value at index 6)
+                if human_action_np.shape[1] == 6:
+                    # Add gripper dimension (default to 0 = gripper open)
+                    human_action_np = np.insert(human_action_np, 6, 0.0, axis=1)
 
-            # Predict with shared autonomy
+                # Convert to tensor with batch dimension
+                human_action_tensor = torch.tensor(
+                    human_action_np,
+                    dtype=torch.float32,
+                    device=self.device,
+                ).unsqueeze(0)  # [1, chunk_size, 7]
+
+            # Predict with shared autonomy (only uses human_action if queue is empty)
             policy_action = self.predict_action(obs, human_action_tensor)
 
             # Extract action (policy_action is a dict with 'action' key)
             policy_action_np = policy_action.cpu().numpy()[0]
 
+            # Send action to robot if connected
+            if self.use_robot and self.robot is not None:
+                self.robot.send_action(policy_action_np)
+
             # Store (use 7-DOF for comparison, policy output is also 7-DOF after postprocessing)
-            human_actions.append(human_action_np[0, :7])  # Take only first 7 dims of the current timestep
+            # For human action, use the current timestep from trajectory (not the chunk)
+            current_human_action = trajectory_qs[t]  # [action_dim]
+            if current_human_action.shape[0] == 6:
+                current_human_action = np.append(current_human_action, 0.0)  # Add gripper
+            human_actions.append(current_human_action[:7])
             policy_actions.append(policy_action_np[:7])  # Take only first 7 dims
 
         # Convert to arrays
@@ -612,6 +795,21 @@ class SharedAutonomyTester:
 
         return results
 
+    def disconnect(self):
+        """Disconnect from robot if connected."""
+        if self.robot is not None:
+            print("\nDisconnecting from robot...")
+            self.robot.disconnect()
+            self.robot = None
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        if self.robot is not None:
+            try:
+                self.disconnect()
+            except Exception:
+                pass
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -634,6 +832,12 @@ def main():
         type=str,
         required=True,
         help="Path to zarr trajectory folder",
+    )
+    parser.add_argument(
+        "--traj_replay_speed",
+        type=float,
+        default=1.0,
+        help="Speed multiplier for trajectory replay",
     )
     parser.add_argument(
         "--num_trajectories",
@@ -690,6 +894,43 @@ def main():
         default=None,
         help="Which forward_flow_ratios to save (default: all tested ratios)",
     )
+    parser.add_argument(
+        "--use_robot",
+        action="store_true",
+        help="Connect to SplatSim robot for real observations and action execution",
+    )
+    parser.add_argument(
+        "--robot_hostname",
+        type=str,
+        default="127.0.0.1",
+        help="Robot IP address (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--robot_port",
+        type=int,
+        default=6001,
+        help="Robot ZMQ port (default: 6001)",
+    )
+    parser.add_argument(
+        "--base_camera_port",
+        type=int,
+        default=5001,
+        help="Base camera port (default: 5001)",
+    )
+    parser.add_argument(
+        "--control_rate_hz",
+        type=int,
+        default=50,
+        help="Robot control rate in Hz (default: 50)",
+    )
+    parser.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=10,
+        help="Number of actions to execute from each predicted chunk (default: 10). "
+             "Lower values create more overlap between chunks for smoother motion. "
+             "Set to None to use policy's default (usually 50, which causes jerky motion).",
+    )
 
     args = parser.parse_args()
 
@@ -705,8 +946,15 @@ def main():
         policy_path=args.policy_path,
         dataset_repo_id=args.dataset_repo_id,
         traj_folder=args.traj_folder,
+        traj_replay_speed=args.traj_replay_speed,
         device=args.device,
         task_description=args.task_description,
+        use_robot=args.use_robot,
+        robot_hostname=args.robot_hostname,
+        robot_port=args.robot_port,
+        base_camera_port=args.base_camera_port,
+        control_rate_hz=args.control_rate_hz,
+        n_action_steps=args.n_action_steps,
     )
 
     # Initialize trajectory saver if requested
@@ -781,6 +1029,9 @@ def main():
         print(f"  Total trajectories saved: {total_saved}")
         print(f"  Ratios saved: {sorted(save_ratios_set)}")
     print(f"{'='*80}")
+
+    # Cleanup
+    tester.disconnect()
 
 
 if __name__ == "__main__":
