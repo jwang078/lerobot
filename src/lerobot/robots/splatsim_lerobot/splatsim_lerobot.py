@@ -168,6 +168,8 @@ class SplatSimLerobot(Robot):
                 )
                 # Change from (C, H, W) to (H, W, C)
                 lerobot_obs["wrist_rgb"] = wrist_rgb_resized.transpose(1, 2, 0)
+            else:
+                logger.warning("No wrist_rgb in observation!")
 
         # Process joint positions (state)
         joint_positions = obs.get("joint_positions")
