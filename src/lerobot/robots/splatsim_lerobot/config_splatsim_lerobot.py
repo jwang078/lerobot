@@ -41,11 +41,13 @@ class SplatSimLerobotConfig(RobotConfig):
     image_width: int = 224
     image_height: int = 224
 
+    # Related to camera ports
     # Cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
-    # Whether to include wrist camera
-    use_wrist_camera: bool = False
+    # More of a SplatSim config, which do not exist on a camera port
+    # Camera names to include in observations (e.g., ["base_rgb"], ["wrist_rgb"], or ["base_rgb", "wrist_rgb"])
+    camera_names: list[str] = field(default_factory=lambda: ["base_rgb", "wrist_rgb"])
 
     # Joint names (can be configured to match your dataset)
     joint_names: list[str] = field(
