@@ -147,6 +147,7 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
+    all_info_metrics: dict[str, list[torch.Tensor]] = {}  # Custom metrics from info dict
 
     step = 0
     # Keep track of which environments are done.
@@ -173,7 +174,12 @@ def rollout(
         observation = env_preprocessor(observation)
 
         observation = preprocessor(observation)
-        with torch.inference_mode():
+        amp_device_type = policy.config.device if hasattr(policy.config, "device") else "cuda"
+        use_amp = getattr(policy.config, "use_amp", False)
+        with (
+            torch.inference_mode(),
+            torch.autocast(device_type=amp_device_type) if use_amp else nullcontext(),
+        ):
             action = policy.select_action(observation)
         action = postprocessor(action)
 
@@ -216,6 +222,16 @@ def rollout(
         all_dones.append(torch.from_numpy(done))
         all_successes.append(torch.tensor(successes))
 
+        # Collect custom metrics from info dict (e.g., "in_collision", "distance_to_goal")
+        # These are per-env boolean or scalar values that get logged per step
+        for key, value in info.items():
+            if key in ("final_obs", "final_info", "is_success", "step_count") or key.startswith("_"):
+                continue  # Skip regular keys
+            if isinstance(value, np.ndarray) and value.shape == (env.num_envs,):
+                if key not in all_info_metrics:
+                    all_info_metrics[key] = []
+                all_info_metrics[key].append(torch.from_numpy(value.copy()))
+
         step += 1
         running_success_rate = (
             einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
@@ -235,6 +251,10 @@ def rollout(
         "success": torch.stack(all_successes, dim=1),
         "done": torch.stack(all_dones, dim=1),
     }
+
+    # Add custom info metrics (e.g., "in_collision") as (batch, sequence) tensors
+    if all_info_metrics:
+        ret["info_metrics"] = {key: torch.stack(values, dim=1) for key, values in all_info_metrics.items()}
     if return_observations:
         stacked_observations = {}
         for key in all_observations[0]:
@@ -301,6 +321,7 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_info_metrics: dict[str, list[float]] = {}  # Aggregated custom metrics per episode
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -364,6 +385,24 @@ def eval_policy(
         max_rewards.extend(batch_max_rewards.tolist())
         batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
         all_successes.extend(batch_successes.tolist())
+
+        # Aggregate custom info metrics (e.g., count steps where in_collision=True)
+        if "info_metrics" in rollout_data:
+            for metric_name, metric_data in rollout_data["info_metrics"].items():
+                if metric_name not in all_info_metrics:
+                    all_info_metrics[metric_name] = []
+                # For boolean metrics (like in_collision), compute sum of True steps per episode
+                # For scalar metrics, compute mean per episode
+                if metric_data.dtype == torch.bool:
+                    # Count how many steps have this condition true (masked to valid steps)
+                    batch_metric = einops.reduce((metric_data.int() * mask), "b n -> b", "sum")
+                else:
+                    # For scalar metrics, compute mean over valid steps
+                    batch_metric = einops.reduce((metric_data.float() * mask), "b n -> b", "sum") / mask.sum(
+                        dim=1
+                    ).clamp(min=1)
+                all_info_metrics[metric_name].extend(batch_metric.tolist())
+
         if seeds:
             all_seeds.extend(seeds)
         else:
@@ -420,32 +459,45 @@ def eval_policy(
         thread.join()
 
     # Compile eval info.
+    # Build per-episode info with optional custom metrics
+    per_episode_info = []
+    for i, (sum_reward, max_reward, success, seed) in enumerate(
+        zip(
+            sum_rewards[:n_episodes],
+            max_rewards[:n_episodes],
+            all_successes[:n_episodes],
+            all_seeds[:n_episodes],
+            strict=True,
+        )
+    ):
+        ep_info = {
+            "episode_ix": i,
+            "sum_reward": sum_reward,
+            "max_reward": max_reward,
+            "success": success,
+            "seed": seed,
+        }
+        # Add custom info metrics for this episode
+        for metric_name, metric_values in all_info_metrics.items():
+            if i < len(metric_values):
+                ep_info[metric_name] = metric_values[i]
+        per_episode_info.append(ep_info)
+
+    # Build aggregated metrics
+    aggregated = {
+        "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
+        "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
+        "pc_success": float(np.nanmean(all_successes[:n_episodes]) * 100),
+        "eval_s": time.time() - start,
+        "eval_ep_s": (time.time() - start) / n_episodes,
+    }
+    # Add aggregated custom info metrics (mean across episodes)
+    for metric_name, metric_values in all_info_metrics.items():
+        aggregated[f"avg_{metric_name}"] = float(np.nanmean(metric_values[:n_episodes]))
+
     info = {
-        "per_episode": [
-            {
-                "episode_ix": i,
-                "sum_reward": sum_reward,
-                "max_reward": max_reward,
-                "success": success,
-                "seed": seed,
-            }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
-                zip(
-                    sum_rewards[:n_episodes],
-                    max_rewards[:n_episodes],
-                    all_successes[:n_episodes],
-                    all_seeds[:n_episodes],
-                    strict=True,
-                )
-            )
-        ],
-        "aggregated": {
-            "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
-            "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
-            "pc_success": float(np.nanmean(all_successes[:n_episodes]) * 100),
-            "eval_s": time.time() - start,
-            "eval_ep_s": (time.time() - start) / n_episodes,
-        },
+        "per_episode": per_episode_info,
+        "aggregated": aggregated,
     }
 
     if return_episode_data:
@@ -507,10 +559,12 @@ def eval_main(cfg: EvalPipelineConfig):
     logging.info(pformat(asdict(cfg)))
 
     # Check device is available
-    device = get_safe_torch_device(cfg.policy.device, log=True)
+    if cfg.policy is not None:
+        get_safe_torch_device(cfg.policy.device, log=True)
 
     torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
+    # Note: TF32 is enabled AFTER environment creation to avoid numerical precision
+    # issues with rotation matrix computations in some simulators (e.g., SplatSim)
     set_seed(cfg.seed)
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
@@ -522,6 +576,11 @@ def eval_main(cfg: EvalPipelineConfig):
         use_async_envs=cfg.eval.use_async_envs,
         trust_remote_code=cfg.trust_remote_code,
     )
+
+    # Enable TF32 for faster matmul, but not for SplatSim which has precision-sensitive
+    # rotation matrix computations in e3nn
+    if "splatsim" not in cfg.env.type:
+        torch.backends.cuda.matmul.allow_tf32 = True
 
     logging.info("Making policy.")
 
@@ -548,7 +607,9 @@ def eval_main(cfg: EvalPipelineConfig):
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
-    with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+    # Note: AMP (autocast) is applied only around policy inference, not env operations,
+    # because some simulators (e.g., SplatSim with e3nn) don't support half precision
+    with torch.no_grad():
         info = eval_policy_all(
             envs=envs,
             policy=policy,
@@ -580,14 +641,15 @@ def eval_main(cfg: EvalPipelineConfig):
 
 
 # ---- typed payload returned by one task eval ----
-class TaskMetrics(TypedDict):
+class TaskMetrics(TypedDict, total=False):
     sum_rewards: list[float]
     max_rewards: list[float]
     successes: list[bool]
     video_paths: list[str]
+    info_metrics: dict[str, list[float]]  # Custom metrics from env info dict
 
 
-ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
+ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths", "info_metrics")
 
 
 def eval_one(
@@ -623,12 +685,25 @@ def eval_one(
     )
 
     per_episode = task_result["per_episode"]
-    return TaskMetrics(
+
+    # Extract custom info metrics from per_episode data
+    # These are any keys that aren't the standard ones
+    standard_keys = {"episode_ix", "sum_reward", "max_reward", "success", "seed"}
+    info_metrics: dict[str, list[float]] = {}
+    if per_episode:
+        for key in per_episode[0]:
+            if key not in standard_keys:
+                info_metrics[key] = [ep[key] for ep in per_episode]
+
+    result = TaskMetrics(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
     )
+    if info_metrics:
+        result["info_metrics"] = info_metrics
+    return result
 
 
 def run_one(
@@ -709,6 +784,10 @@ def eval_policy_all(
     overall: dict[str, list] = {k: [] for k in ACC_KEYS}
     per_task_infos: list[dict] = []
 
+    # Track custom info metrics separately (dynamic keys)
+    group_info_metrics: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    overall_info_metrics: dict[str, list] = defaultdict(list)
+
     # small inline helper to accumulate one task's metrics into accumulators
     def _accumulate_to(group: str, metrics: dict):
         # metrics expected to contain 'sum_rewards', 'max_rewards', 'successes', optionally 'video_paths'
@@ -732,6 +811,16 @@ def eval_policy_all(
         if paths:
             group_acc[group]["video_paths"].extend(paths)
             overall["video_paths"].extend(paths)
+
+        # Handle custom info metrics
+        info_metrics = metrics.get("info_metrics", {})
+        for metric_name, metric_values in info_metrics.items():
+            if isinstance(metric_values, list):
+                group_info_metrics[group][metric_name].extend(metric_values)
+                overall_info_metrics[metric_name].extend(metric_values)
+            else:
+                group_info_metrics[group][metric_name].append(metric_values)
+                overall_info_metrics[metric_name].append(metric_values)
 
     # Choose runner (sequential vs threaded)
     task_runner = partial(
@@ -777,13 +866,17 @@ def eval_policy_all(
     # compute per-group aggregates
     groups_aggregated = {}
     for group, acc in group_acc.items():
-        groups_aggregated[group] = {
+        group_agg = {
             "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
             "avg_max_reward": _agg_from_list(acc["max_rewards"]),
             "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
             "n_episodes": len(acc["sum_rewards"]),
             "video_paths": list(acc["video_paths"]),
         }
+        # Add custom info metrics for this group
+        for metric_name, metric_values in group_info_metrics[group].items():
+            group_agg[f"avg_{metric_name}"] = _agg_from_list(metric_values)
+        groups_aggregated[group] = group_agg
 
     # overall aggregates
     overall_agg = {
@@ -795,6 +888,9 @@ def eval_policy_all(
         "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
         "video_paths": list(overall["video_paths"]),
     }
+    # Add custom info metrics to overall
+    for metric_name, metric_values in overall_info_metrics.items():
+        overall_agg[f"avg_{metric_name}"] = _agg_from_list(metric_values)
 
     return {
         "per_task": per_task_infos,
