@@ -48,12 +48,11 @@ class SplatSimLerobot(Robot):
     @cached_property
     def observation_features(self) -> dict:
         """Define observation space"""
-        features = {
-            "images.base_rgb": (self.config.image_height, self.config.image_width, 3),
-        }
+        features = {}
 
-        if self.config.use_wrist_camera:
-            features["images.wrist_rgb"] = (self.config.image_height, self.config.image_width, 3)
+        # Add each configured camera
+        for camera_name in self.config.camera_names:
+            features[f"images.{camera_name}"] = (self.config.image_height, self.config.image_width, 3)
 
         # Add individual state features for each joint (LeRobot expects named joints)
         for joint_name in self.config.joint_names:
@@ -84,7 +83,6 @@ class SplatSimLerobot(Robot):
         try:
             # Lazy import to avoid dependency issues
             from gello.env import RobotEnv
-            from gello.zmq_core.camera_node import ZMQClientCamera
             from gello.zmq_core.robot_node import ZMQClientRobot
         except ImportError as e:
             raise ImportError(
@@ -141,35 +139,20 @@ class SplatSimLerobot(Robot):
         # Format observation to match LeRobot expectations
         lerobot_obs = {}
 
-        # Process base_rgb image (comes from robot_obs in RobotEnv)
-        base_rgb = obs.get("base_rgb")
-        if base_rgb is not None:
-            # Convert to numpy if needed
-            if isinstance(base_rgb, torch.Tensor):
-                base_rgb = base_rgb.detach().cpu().numpy()
+        # Process each configured camera
+        for camera_name in self.config.camera_names:
+            img = obs.get(camera_name)
+            if img is not None:
+                # Convert to numpy if needed
+                if isinstance(img, torch.Tensor):
+                    img = img.detach().cpu().numpy()
 
-            # Resize to configured size
-            base_rgb_resized = letterbox(
-                base_rgb, output_size=(self.config.image_height, self.config.image_width)
-            )
-            # Change from (C, H, W) to (H, W, C)
-            lerobot_obs["base_rgb"] = base_rgb_resized.transpose(1, 2, 0)
-        else:
-            logger.warning("No base_rgb in observation!")
-
-        # Process wrist_rgb if available
-        if self.config.use_wrist_camera:
-            wrist_rgb = obs.get("wrist_rgb")
-            if wrist_rgb is not None:
-                if isinstance(wrist_rgb, torch.Tensor):
-                    wrist_rgb = wrist_rgb.detach().cpu().numpy()
-                wrist_rgb_resized = letterbox(
-                    wrist_rgb, output_size=(self.config.image_height, self.config.image_width)
-                )
+                # Resize to configured size
+                img_resized = letterbox(img, output_size=(self.config.image_height, self.config.image_width))
                 # Change from (C, H, W) to (H, W, C)
-                lerobot_obs["wrist_rgb"] = wrist_rgb_resized.transpose(1, 2, 0)
+                lerobot_obs[camera_name] = img_resized.transpose(1, 2, 0)
             else:
-                logger.warning("No wrist_rgb in observation!")
+                logger.warning(f"No {camera_name} in observation!")
 
         # Process joint positions (state)
         joint_positions = obs.get("joint_positions")
