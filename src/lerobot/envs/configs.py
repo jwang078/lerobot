@@ -387,6 +387,93 @@ class MetaworldEnv(EnvConfig):
         }
 
 
+@EnvConfig.register_subclass("splatsim")
+@dataclass
+class SplatSimEnv(EnvConfig):
+    """Configuration for SplatSim Gym environment.
+
+    SplatSim is a Gaussian splatting-based robot simulation environment.
+    The actual Gym environment is defined in the splatsim package and must be
+    registered with gymnasium before use.
+
+    Example usage:
+        lerobot-eval \\
+            --policy.path=your/checkpoint \\
+            --env.type=splatsim \\
+            --env.task=upright_small_engine_new \\
+            --eval.n_episodes=50
+    """
+
+    task: str = "upright_small_engine_new"
+    fps: int = 30
+    episode_length: int = 400  # 8 seconds at 50 fps, matching Aloha
+    render_mode: str = "rgb_array"
+
+    # Task description for language-conditioned policies (e.g., PI0, PI05)
+    # This should match the task description used during training
+    task_description: str | None = None
+
+    # SplatSim-specific config
+    robot_name: str = "robot_iphone_w_engine_new"
+    cam_i: int = 3
+    camera_names: list[str] = field(default_factory=lambda: ["base_rgb", "wrist_rgb"])
+    use_gripper: bool = True
+    debug_mode: str | None = None
+
+    # Image dimensions
+    observation_height: int = 224
+    observation_width: int = 224
+
+    # State dimension (6 joints + 1 gripper = 7)
+    state_dim: int = 7
+    # Action dimension (6 joints + 1 gripper = 7)
+    action_dim: int = 7
+
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+        }
+    )
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+            "agent_pos": OBS_STATE,
+            "pixels": OBS_IMAGE,
+            "pixels/base_rgb": f"{OBS_IMAGES}.base_rgb",
+            "pixels/wrist_rgb": f"{OBS_IMAGES}.wrist_rgb",
+        }
+    )
+
+    def __post_init__(self):
+        # Set state feature
+        self.features["agent_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(self.state_dim,))
+
+        # Set image features - always use "pixels/<camera_name>" format for consistency
+        # This maps to "observation.images.<camera_name>" in LeRobot format
+        for cam_name in self.camera_names:
+            self.features[f"pixels/{cam_name}"] = PolicyFeature(
+                type=FeatureType.VISUAL,
+                shape=(self.observation_height, self.observation_width, 3),
+            )
+
+    @property
+    def gym_kwargs(self) -> dict:
+        cfg = {
+            "robot_name": self.robot_name,
+            "camera_names": self.camera_names,
+            "cam_i": self.cam_i,
+            "use_gripper": self.use_gripper,
+            "debug_mode": self.debug_mode,
+        }
+        # Include task_description if provided (for language-conditioned policies)
+        if self.task_description is not None:
+            cfg["task_description"] = self.task_description
+        return {
+            "cfg": cfg,
+            "render_mode": self.render_mode,
+        }
+
+
 @EnvConfig.register_subclass("isaaclab_arena")
 @dataclass
 class IsaaclabArenaEnv(HubEnvConfig):

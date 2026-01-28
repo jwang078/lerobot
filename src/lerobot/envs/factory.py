@@ -20,11 +20,21 @@ import gymnasium as gym
 from gymnasium.envs.registration import registry as gym_registry
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.envs.configs import AlohaEnv, EnvConfig, HubEnvConfig, IsaaclabArenaEnv, LiberoEnv, PushtEnv
+from lerobot.envs.configs import (
+    AlohaEnv,
+    EnvConfig,
+    HubEnvConfig,
+    IsaaclabArenaEnv,
+    LiberoEnv,
+    PushtEnv,
+)
 from lerobot.envs.utils import _call_make_env, _download_hub_file, _import_hub_module, _normalize_hub_result
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 from lerobot.processor import ProcessorStep
-from lerobot.processor.env_processor import IsaaclabArenaProcessorStep, LiberoProcessorStep
+from lerobot.processor.env_processor import (
+    IsaaclabArenaProcessorStep,
+    LiberoProcessorStep,
+)
 from lerobot.processor.pipeline import PolicyProcessorPipeline
 
 
@@ -193,6 +203,28 @@ def make_env(
             gym_kwargs=cfg.gym_kwargs,
             env_cls=env_cls,
         )
+    elif "splatsim" in cfg.type:
+        from splatsim.gym_env import make_single_env
+
+        if cfg.task is None:
+            raise ValueError("SplatSimEnv requires a task to be specified")
+
+        # Debug: print the parameters being passed
+        splatsim_cfg = cfg.gym_kwargs.get("cfg", {})
+        splatsim_render_mode = cfg.gym_kwargs.get("render_mode", "rgb_array")
+
+        def _make_splatsim():
+            return make_single_env(
+                cfg.task,
+                cfg=splatsim_cfg,
+                render_mode=splatsim_render_mode,
+            )
+
+        vec = env_cls(
+            [_make_splatsim for _ in range(n_envs)],
+            autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
+        )
+        return {"splatsim": {0: vec}}
 
     if cfg.gym_id not in gym_registry:
         print(f"gym id '{cfg.gym_id}' not found, attempting to import '{cfg.package_name}'...")
