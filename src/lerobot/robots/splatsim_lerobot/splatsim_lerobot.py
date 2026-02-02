@@ -18,8 +18,12 @@ import logging
 from functools import cached_property
 from typing import Any
 
+import cv2
 import numpy as np
 import torch
+from gello.env import RobotEnv
+from gello.zmq_core.robot_node import ZMQClientRobot
+from splatsim.utils.image_utils import letterbox
 
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
@@ -27,6 +31,30 @@ from ..robot import Robot
 from .config_splatsim_lerobot import SplatSimLerobotConfig
 
 logger = logging.getLogger(__name__)
+
+
+def resize_image(img: np.ndarray, output_size: tuple[int, int], mode: str = "letterbox") -> np.ndarray:
+    """Resize image to output_size using the specified mode.
+
+    Args:
+        img: Input image in CHW format (channels, height, width), float32 in [0, 1]
+        output_size: Target (height, width)
+        mode: Resize mode - "letterbox" or "stretch"
+
+    Returns:
+        Resized image in CHW format, float32 in [0, 1]
+    """
+    if mode == "letterbox":
+        return letterbox(img, output_size=output_size)
+    elif mode == "stretch":
+        # Convert from CHW to HWC for cv2
+        img_hwc = np.transpose(img, (1, 2, 0))
+        # Resize using cv2 (stretches to fill, ignoring aspect ratio)
+        img_resized = cv2.resize(img_hwc, (output_size[1], output_size[0]), interpolation=cv2.INTER_LINEAR)
+        # Convert back to CHW
+        return np.transpose(img_resized, (2, 0, 1))
+    else:
+        raise ValueError(f"Unknown image resize mode: {mode}. Use 'letterbox' or 'stretch'.")
 
 
 class SplatSimLerobot(Robot):
@@ -80,16 +108,6 @@ class SplatSimLerobot(Robot):
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
-        try:
-            # Lazy import to avoid dependency issues
-            from gello.env import RobotEnv
-            from gello.zmq_core.robot_node import ZMQClientRobot
-        except ImportError as e:
-            raise ImportError(
-                "gello package is required for SplatSimLerobot. "
-                "Please install it with: pip install gello-software"
-            ) from e
-
         # Create ZMQ robot client
         self.robot_client = ZMQClientRobot(port=self.config.robot_port, host=self.config.hostname)
 
@@ -125,14 +143,6 @@ class SplatSimLerobot(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        try:
-            from splatsim.utils.image_utils import letterbox
-        except ImportError as e:
-            raise ImportError(
-                "splatsim package is required for image processing. "
-                "Please install it with: pip install splatsim"
-            ) from e
-
         # Get observation from RobotEnv - this includes images!
         obs = self.env.get_obs()
 
@@ -147,8 +157,12 @@ class SplatSimLerobot(Robot):
                 if isinstance(img, torch.Tensor):
                     img = img.detach().cpu().numpy()
 
-                # Resize to configured size
-                img_resized = letterbox(img, output_size=(self.config.image_height, self.config.image_width))
+                # Resize to configured size using configured mode
+                img_resized = resize_image(
+                    img,
+                    output_size=(self.config.image_height, self.config.image_width),
+                    mode=self.config.image_resize_mode,
+                )
                 # Change from (C, H, W) to (H, W, C)
                 lerobot_obs[camera_name] = img_resized.transpose(1, 2, 0)
             else:

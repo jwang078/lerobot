@@ -15,10 +15,26 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import Literal
 
 from lerobot.cameras import CameraConfig
 
 from ..config import RobotConfig
+
+
+class ImageResizeMode(str, Enum):
+    """Image resize modes for SplatSim observations.
+
+    LETTERBOX: Resize while keeping aspect ratio, pad with black bars.
+               Good for pretrained VLAs (PI0, PI0.5) that expect preserved aspect ratios.
+    STRETCH: Resize to fill entire target size without keeping aspect ratio.
+             Good for policies trained from scratch (diffusion) that benefit from
+             using the full image area without black padding.
+    """
+
+    LETTERBOX = "letterbox"
+    STRETCH = "stretch"
 
 
 @RobotConfig.register_subclass("splatsim_lerobot")
@@ -40,6 +56,11 @@ class SplatSimLerobotConfig(RobotConfig):
     # Image size for observations
     image_width: int = 224
     image_height: int = 224
+
+    # Image resize mode:
+    # - "letterbox": Resize keeping aspect ratio, pad with black bars (good for pretrained VLAs)
+    # - "stretch": Resize to fill entire area without keeping aspect ratio (good for diffusion)
+    image_resize_mode: Literal["letterbox", "stretch"] = "letterbox"
 
     # Related to camera ports
     # Cameras

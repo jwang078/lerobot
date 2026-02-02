@@ -96,8 +96,16 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
     echo "========================================"
 
     # Process each checkpoint
+    index=0
     for checkpoint_dir in "$checkpoints_dir"/*; do
         [ -d "$checkpoint_dir" ] || continue
+
+        # Skip first checkpoint for debugging
+        if [ $index -eq 0 ]; then
+            ((index++))
+            continue
+        fi
+        ((index++))
 
         checkpoint_name=$(basename "$checkpoint_dir")
 
@@ -142,18 +150,22 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
             echo "========================================"
             echo ""
 
-                # --eval.n_episodes=10 \
+            eval_cmd="lerobot-eval \\
+                --env.type=splatsim \\
+                --env.task=upright_small_engine_new \\
+                --env.camera_names='$camera_names' \\
+                --env.fps=30 \\
+                --policy.path=$policy_path \\
+                --eval.n_episodes=5 \\
+                --output_dir=$eval_subdir \\
+                --eval.batch_size=1 \\
+                --eval.use_async_envs=false"
 
-            lerobot-eval \
-                --env.type=splatsim \
-                --env.task=upright_small_engine_new \
-                --env.camera_names="$camera_names" \
-                --env.fps=30 \
-                --policy.path="$policy_path" \
-                --eval.n_episodes=5 \
-                --output_dir="$eval_subdir" \
-                --eval.batch_size=1 \
-                --eval.use_async_envs=false
+            echo "Command:"
+            echo "$eval_cmd"
+            echo ""
+
+            eval "$eval_cmd"
 
             echo ""
             echo "========================================"
