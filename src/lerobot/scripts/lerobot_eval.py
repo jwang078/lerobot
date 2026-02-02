@@ -563,8 +563,7 @@ def eval_main(cfg: EvalPipelineConfig):
         get_safe_torch_device(cfg.policy.device, log=True)
 
     torch.backends.cudnn.benchmark = True
-    # Note: TF32 is enabled AFTER environment creation to avoid numerical precision
-    # issues with rotation matrix computations in some simulators (e.g., SplatSim)
+    torch.backends.cuda.matmul.allow_tf32 = True
     set_seed(cfg.seed)
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
@@ -576,11 +575,6 @@ def eval_main(cfg: EvalPipelineConfig):
         use_async_envs=cfg.eval.use_async_envs,
         trust_remote_code=cfg.trust_remote_code,
     )
-
-    # Enable TF32 for faster matmul, but not for SplatSim which has precision-sensitive
-    # rotation matrix computations in e3nn
-    if "splatsim" not in cfg.env.type:
-        torch.backends.cuda.matmul.allow_tf32 = True
 
     logging.info("Making policy.")
 
