@@ -424,6 +424,11 @@ class SplatSimEnv(EnvConfig):
     observation_height: int = 224
     observation_width: int = 224
 
+    # Image resize mode:
+    # - "letterbox": Resize keeping aspect ratio, pad with black bars (good for pretrained VLAs)
+    # - "stretch": Resize to fill entire area without keeping aspect ratio (good for diffusion)
+    image_resize_mode: str = "letterbox"
+
     # State dimension (6 joints + 1 gripper = 7)
     state_dim: int = 7
     # Action dimension (6 joints + 1 gripper = 7)
@@ -464,6 +469,7 @@ class SplatSimEnv(EnvConfig):
             "cam_i": self.cam_i,
             "use_gripper": self.use_gripper,
             "debug_mode": self.debug_mode,
+            "image_resize_mode": self.image_resize_mode,
         }
         # Include task_description if provided (for language-conditioned policies)
         if self.task_description is not None:
