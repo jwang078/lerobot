@@ -193,6 +193,7 @@ def rollout(
 
         # Apply the next action.
         observation, reward, terminated, truncated, info = env.step(action_numpy)
+
         if render_callback is not None:
             render_callback(env)
 
@@ -224,13 +225,23 @@ def rollout(
 
         # Collect custom metrics from info dict (e.g., "in_collision", "distance_to_goal")
         # These are per-env boolean or scalar values that get logged per step
+        # When an episode terminates, Gymnasium auto-resets and overwrites info with reset values,
+        # so we need to use final_info for terminated environments to get the true final values.
+        final_info = info.get("final_info", {})
+        env_terminated = terminated | truncated
         for key, value in info.items():
             if key in ("final_obs", "final_info", "is_success", "step_count") or key.startswith("_"):
                 continue  # Skip regular keys
             if isinstance(value, np.ndarray) and value.shape == (env.num_envs,):
+                # For terminated envs, use final_info values (pre-reset) instead of info (post-reset)
+                if key in final_info:
+                    value = value.copy()
+                    value[env_terminated] = final_info[key][env_terminated]
                 if key not in all_info_metrics:
                     all_info_metrics[key] = []
-                all_info_metrics[key].append(torch.from_numpy(value.copy()))
+                all_info_metrics[key].append(
+                    torch.from_numpy(value.copy() if key not in final_info else value)
+                )
 
         step += 1
         running_success_rate = (
@@ -375,6 +386,11 @@ def eval_policy(
         # Note: this relies on a property of argmax: that it returns the first occurrence as a tiebreaker.
         done_indices = torch.argmax(rollout_data["done"].to(int), dim=1)
 
+        # Track episode lengths (number of steps taken)
+        if "episode_length" not in all_info_metrics:
+            all_info_metrics["episode_length"] = []
+        all_info_metrics["episode_length"].extend((done_indices + 1).tolist())
+
         # Make a mask with shape (batch, n_steps) to mask out rollout data after the first done
         # (batch-element-wise). Note the `done_indices + 1` to make sure to keep the data from the done step.
         mask = (torch.arange(n_steps) <= einops.repeat(done_indices + 1, "b -> b s", s=n_steps)).int()
@@ -402,6 +418,15 @@ def eval_policy(
                         dim=1
                     ).clamp(min=1)
                 all_info_metrics[metric_name].extend(batch_metric.tolist())
+
+                # For scalar metrics, also track the final value at episode end
+                if metric_data.dtype != torch.bool:
+                    final_metric_name = f"final_{metric_name}"
+                    if final_metric_name not in all_info_metrics:
+                        all_info_metrics[final_metric_name] = []
+                    # Get value at done_indices (last valid step) for each episode
+                    batch_final_metric = metric_data[torch.arange(metric_data.size(0)), done_indices]
+                    all_info_metrics[final_metric_name].extend(batch_final_metric.tolist())
 
         if seeds:
             all_seeds.extend(seeds)

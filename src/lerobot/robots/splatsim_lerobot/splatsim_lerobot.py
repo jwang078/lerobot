@@ -74,7 +74,7 @@ class SplatSimLerobot(Robot):
         self.cameras = {}
 
     @cached_property
-    def observation_features(self) -> dict:
+    def observation_features(self) -> dict[str, type | tuple]:
         """Define observation space"""
         features = {}
 
