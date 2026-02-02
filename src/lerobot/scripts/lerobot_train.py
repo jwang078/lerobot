@@ -421,8 +421,7 @@ def train(cfg: TrainPipelineConfig):
         torch.backends.cudnn.benchmark = False
     else:
         torch.backends.cudnn.benchmark = True
-    # Note: TF32 is enabled AFTER environment creation to avoid numerical precision
-    # issues with rotation matrix computations in some simulators (e.g., SplatSim)
+    torch.backends.cuda.matmul.allow_tf32 = True
 
     # --- data (the main process downloads once; peers read the populated cache) ----------------
     if is_main_process():
@@ -439,11 +438,6 @@ def train(cfg: TrainPipelineConfig):
     if cfg.env_eval_freq > 0 and cfg.env is not None and is_main_process:
         logging.info("Creating env")
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
-
-    # Enable TF32 for faster matmul, but not for SplatSim which has precision-sensitive
-    # rotation matrix computations in e3nn.
-    if cfg.env is None or cfg.env.type != "splatsim":
-        torch.backends.cuda.matmul.allow_tf32 = True
 
     # --- policy (weight source decided by the resume rule) -------------------------------------
     # On resume, cfg was parsed FROM the checkpoint's train_config.json, so cfg.checkpoint_format
@@ -850,11 +844,6 @@ def train(cfg: TrainPipelineConfig):
             if is_main_process():
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
-                # Temporarily disable TF32 for SplatSim which has precision-sensitive
-                # rotation matrix computations in e3nn
-                tf32_was_enabled = torch.backends.cuda.matmul.allow_tf32
-                if cfg.env.type == "splatsim":
-                    torch.backends.cuda.matmul.allow_tf32 = False
                 eval_policy_model = accelerator.unwrap_model(policy)
                 # Evaluate the EMA weights when enabled: the swap happens only on the main
                 # process (the other ranks wait at the barrier below) and is exactly undone
@@ -877,8 +866,6 @@ def train(cfg: TrainPipelineConfig):
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
                     )
-                # Restore TF32 setting for training
-                torch.backends.cuda.matmul.allow_tf32 = tf32_was_enabled
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]
 
