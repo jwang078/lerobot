@@ -418,7 +418,7 @@ class SplatSimEnv(EnvConfig):
     cam_i: int = 3
     camera_names: list[str] = field(default_factory=lambda: ["base_rgb", "wrist_rgb"])
     use_gripper: bool = True
-    debug_mode: str | None = None
+    debug_mode: str = "off"
 
     # Image dimensions
     observation_height: int = 224
