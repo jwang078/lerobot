@@ -502,6 +502,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 eval_tracker.pc_success = aggregated.pop("pc_success")
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    # Log additional info_metrics from eval (e.g., avg_in_collision, avg_episode_length, etc.)
+                    # These are any remaining keys in aggregated after popping the standard metrics
+                    for metric_name, metric_value in aggregated.items():
+                        if metric_name not in ("avg_max_reward", "n_episodes", "eval_ep_s", "video_paths"):
+                            wandb_log_dict[f"eval/{metric_name}"] = metric_value
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
