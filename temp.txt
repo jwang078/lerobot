@@ -1,0 +1,45 @@
+=== DRY RUN MODE - Commands will not be executed ===
+
+========================================
+EVALUATION PLAN
+========================================
+
+Experiment folders to process:
+
+  - diffusion_approach_lever_1path_lr1e-5_scratch_stretch_gn_basewrist (3 checkpoints)
+  - diffusion_approach_lever_1path_lr1e-5_scratch_stretch_gn_wrist (3 checkpoints)
+  - diffusion_approach_lever_300demo_1path_base_lr1e-5_scratch_stretch_gn (3 checkpoints)
+  - pi05_approach_lever_1path_base (3 checkpoints)
+  - pi05_approach_lever_1path_wrist (3 checkpoints)
+
+Total evaluations to run: 15
+========================================
+
+========================================
+Processing experiment: diffusion_approach_lever_1path_lr1e-5_scratch_stretch_gn_basewrist
+Camera names: ["base_rgb", "wrist_rgb"]
+Image resize mode: stretch
+Last numerical checkpoint (will skip): 075000
+========================================
+----------------------------------------
+Running eval for: diffusion_approach_lever_1path_lr1e-5_scratch_stretch_gn_basewrist / 050000
+Policy path: /home/jennyw2/code/lerobot/outputs/training/diffusion_approach_lever_1path_lr1e-5_scratch_stretch_gn_basewrist/checkpoints/050000/pretrained_model
+Output dir: /home/jennyw2/code/lerobot/outputs/eval_output/2026-02-04-125715/diffusion_approach_lever_1path_lr1e-5_scratch_stretch_gn_basewrist_050000
+Log file: /home/jennyw2/code/lerobot/outputs/eval_output/2026-02-04-125715/diffusion_approach_lever_1path_lr1e-5_scratch_stretch_gn_basewrist_050000/eval_log.txt
+----------------------------------------
+Command:
+lerobot-eval \
+            --env.type=splatsim \
+            --env.task=upright_small_engine_new \
+            --env.camera_names='["base_rgb", "wrist_rgb"]' \
+            --env.image_resize_mode=stretch \
+            --env.fps=30 \
+            --policy.path=/home/jennyw2/code/lerobot/outputs/training/diffusion_approach_lever_1path_lr1e-5_scratch_stretch_gn_basewrist/checkpoints/050000/pretrained_model \
+            --eval.n_episodes=5 \
+            --output_dir=/home/jennyw2/code/lerobot/outputs/eval_output/2026-02-04-125715/diffusion_approach_lever_1path_lr1e-5_scratch_stretch_gn_basewrist_050000 \
+            --eval.batch_size=1 \
+            --eval.use_async_envs=false
+
+Completed: diffusion_approach_lever_1path_lr1e-5_scratch_stretch_gn_basewrist / 050000
+
+Pausing for 15 seconds...
