@@ -223,6 +223,11 @@ def rollout(
         all_dones.append(torch.from_numpy(done))
         all_successes.append(torch.tensor(successes))
 
+        # Track whether each env was truncated (timed out) at this step
+        if "truncated" not in all_info_metrics:
+            all_info_metrics["truncated"] = []
+        all_info_metrics["truncated"].append(torch.from_numpy(truncated.copy()))
+
         # Collect custom metrics from info dict (e.g., "in_collision", "distance_to_goal")
         # These are per-env boolean or scalar values that get logged per step
         # When an episode terminates, Gymnasium auto-resets and overwrites info with reset values,
@@ -509,7 +514,7 @@ def eval_policy(
         per_episode_info.append(ep_info)
 
     # Build aggregated metrics
-    aggregated = {
+    aggregated: dict[str, float | None] = {
         "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
         "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
         "pc_success": float(np.nanmean(all_successes[:n_episodes]) * 100),
@@ -519,6 +524,17 @@ def eval_policy(
     # Add aggregated custom info metrics (mean across episodes)
     for metric_name, metric_values in all_info_metrics.items():
         aggregated[f"avg_{metric_name}"] = float(np.nanmean(metric_values[:n_episodes]))
+
+    # Compute avg episode length excluding truncated (timed-out) episodes
+    if "episode_length" in all_info_metrics and "truncated" in all_info_metrics:
+        ep_lens = all_info_metrics["episode_length"][:n_episodes]
+        trunc_flags = all_info_metrics["truncated"][:n_episodes]
+        non_truncated_lens = [
+            episode_len for episode_len, truncated in zip(ep_lens, trunc_flags, strict=True) if not truncated
+        ]
+        aggregated["avg_episode_length_without_truncation"] = (
+            float(np.mean(non_truncated_lens)) if non_truncated_lens else None
+        )
 
     info = {
         "per_episode": per_episode_info,
@@ -649,12 +665,19 @@ def eval_main(cfg: EvalPipelineConfig):
         for task_group, task_group_info in info.items():
             print(f"\nAggregated Metrics for {task_group}:")
             print(task_group_info)
-    # Close all vec envs
-    close_envs(envs)
 
     # Save info
+    def _json_default(obj):
+        if isinstance(obj, np.generic):
+            return obj.item()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
     with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
-        json.dump(info, f, indent=2)
+        json.dump(info, f, indent=2, default=_json_default)
+
+    # TODO fix closing of splatsim env. this was supposed to be above saving eval_info.json
+    # Close all vec envs
+    close_envs(envs)
 
     logging.info("End of eval")
 
@@ -893,8 +916,18 @@ def eval_policy_all(
             "video_paths": list(acc["video_paths"]),
         }
         # Add custom info metrics for this group
-        for metric_name, metric_values in group_info_metrics[group].items():
+        gim = group_info_metrics[group]
+        for metric_name, metric_values in gim.items():
             group_agg[f"avg_{metric_name}"] = _agg_from_list(metric_values)
+        if "episode_length" in gim and "truncated" in gim:
+            non_trunc = [
+                episode_len
+                for episode_len, truncated in zip(gim["episode_length"], gim["truncated"], strict=True)
+                if not truncated
+            ]
+            group_agg["avg_episode_length_without_truncation"] = (
+                float(np.mean(non_trunc)) if non_trunc else None
+            )
         groups_aggregated[group] = group_agg
 
     # overall aggregates
@@ -910,6 +943,17 @@ def eval_policy_all(
     # Add custom info metrics to overall
     for metric_name, metric_values in overall_info_metrics.items():
         overall_agg[f"avg_{metric_name}"] = _agg_from_list(metric_values)
+    if "episode_length" in overall_info_metrics and "truncated" in overall_info_metrics:
+        non_trunc = [
+            episode_len
+            for episode_len, truncated in zip(
+                overall_info_metrics["episode_length"], overall_info_metrics["truncated"], strict=True
+            )
+            if not truncated
+        ]
+        overall_agg["avg_episode_length_without_truncation"] = (
+            float(np.mean(non_trunc)) if non_trunc else None
+        )
 
     return {
         "per_task": per_task_infos,
