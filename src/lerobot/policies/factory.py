@@ -400,6 +400,18 @@ def make_pre_post_processors(
         except Exception as e:
             raise ValueError(f"Processor for policy type '{policy_cfg.type}' is not implemented.") from e
 
+    # Apply rename_map from preprocessor_overrides to the RenameObservationsProcessorStep.
+    # Policy-specific factory functions hardcode rename_map={}, so we patch it here after the fact.
+    rename_map = (
+        (kwargs.get("preprocessor_overrides") or {})
+        .get("rename_observations_processor", {})
+        .get("rename_map")
+    )
+    if rename_map:
+        for step in processors[0].steps:
+            if hasattr(step, "rename_map"):
+                step.rename_map = rename_map
+
     return processors
 
 

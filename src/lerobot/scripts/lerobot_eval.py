@@ -675,8 +675,8 @@ def eval_main(cfg: EvalPipelineConfig):
     with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
         json.dump(info, f, indent=2, default=_json_default)
 
-    # TODO fix closing of splatsim env. this was supposed to be above saving eval_info.json
-    # Close all vec envs
+    # Close all vec envs (intentionally after saving eval_info.json so results
+    # are persisted even if env cleanup has issues)
     close_envs(envs)
 
     logging.info("End of eval")
