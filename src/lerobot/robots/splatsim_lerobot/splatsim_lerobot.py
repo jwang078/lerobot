@@ -151,20 +151,22 @@ class SplatSimLerobot(Robot):
 
         # Process each configured camera
         for camera_name in self.config.camera_names:
-            img = obs.get(camera_name)
-            if img is not None:
-                # Convert to numpy if needed
-                if isinstance(img, torch.Tensor):
-                    img = img.detach().cpu().numpy()
+            for image_resize_mode in self.config.image_resize_modes:
+                key = f"{camera_name}_{image_resize_mode}"
+                img = obs.get(camera_name)
+                if img is not None:
+                    # Convert to numpy if needed
+                    if isinstance(img, torch.Tensor):
+                        img = img.detach().cpu().numpy()
 
-                # Resize to configured size using configured mode
-                img_resized = resize_image(
-                    img,
-                    output_size=(self.config.image_height, self.config.image_width),
-                    mode=self.config.image_resize_mode,
-                )
-                # Change from (C, H, W) to (H, W, C)
-                lerobot_obs[camera_name] = img_resized.transpose(1, 2, 0)
+                    # Resize to configured size using configured mode
+                    img_resized = resize_image(
+                        img,
+                        output_size=(self.config.image_height, self.config.image_width),
+                        mode=image_resize_mode,
+                    )
+                    # Change from (C, H, W) to (H, W, C)
+                    lerobot_obs[key] = img_resized.transpose(1, 2, 0)
             else:
                 logger.warning(f"No {camera_name} in observation!")
 

@@ -16,7 +16,6 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal
 
 from lerobot.cameras import CameraConfig
 
@@ -60,7 +59,7 @@ class SplatSimLerobotConfig(RobotConfig):
     # Image resize mode:
     # - "letterbox": Resize keeping aspect ratio, pad with black bars (good for pretrained VLAs)
     # - "stretch": Resize to fill entire area without keeping aspect ratio (good for diffusion)
-    image_resize_mode: Literal["letterbox", "stretch"] = "letterbox"
+    image_resize_modes: list[str] = field(default_factory=lambda: ["letterbox"])
 
     # Related to camera ports
     # Cameras
