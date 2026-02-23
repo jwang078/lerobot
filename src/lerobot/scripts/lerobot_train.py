@@ -297,13 +297,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
             "rename_map": cfg.rename_map
         }
-        postprocessor_kwargs["postprocessor_overrides"] = {
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": policy.config.output_features,
-                "norm_map": policy.config.normalization_mapping,
-            },
+    else:
+        processor_kwargs["preprocessor_overrides"] = {
+            "rename_observations_processor": {"rename_map": cfg.rename_map}
         }
+    # TODO check if this block is right (Jenny)
+    postprocessor_kwargs["postprocessor_overrides"] = {
+        "unnormalizer_processor": {
+            "stats": dataset.meta.stats,
+            "features": policy.config.output_features,
+            "norm_map": policy.config.normalization_mapping,
+        },
+    }
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
