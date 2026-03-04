@@ -420,6 +420,8 @@ class SplatSimEnv(EnvConfig):
     use_gripper: bool = True
     debug_mode: str = "off"
 
+    port: int | None = None
+
     # Image dimensions
     observation_height: int = 224
     observation_width: int = 224
@@ -470,6 +472,7 @@ class SplatSimEnv(EnvConfig):
             "use_gripper": self.use_gripper,
             "debug_mode": self.debug_mode,
             "image_resize_modes": self.image_resize_modes,
+            "port": self.port,
         }
         # Include task_description if provided (for language-conditioned policies)
         if self.task_description is not None:

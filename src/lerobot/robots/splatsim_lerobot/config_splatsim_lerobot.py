@@ -42,7 +42,7 @@ class SplatSimLerobotConfig(RobotConfig):
     """Configuration for SplatSim LeRobot simulation robot"""
 
     # ZMQ connection settings
-    robot_port: int = 6001
+    port: int | None = None
     hostname: str = "127.0.0.1"
 
     # Camera ports
