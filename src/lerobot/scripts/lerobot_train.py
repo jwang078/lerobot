@@ -277,9 +277,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}
     postprocessor_kwargs = {}
+
+    # Apply rename_map to dataset stats keys so the normalizer can find them after the rename step.
+    # The rename step runs before normalization, so stats must be keyed by the post-rename names.
+    # e.g. "observation.images.base_rgb_letterbox" -> "observation.images.base_rgb"
+    renamed_stats = {cfg.rename_map.get(k, k): v for k, v in dataset.meta.stats.items()}
+
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
-        processor_kwargs["dataset_stats"] = dataset.meta.stats
+        processor_kwargs["dataset_stats"] = renamed_stats
 
     # For SARM, always provide dataset_meta for progress normalization
     if cfg.policy.type == "sarm":
@@ -289,7 +295,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": renamed_stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -301,10 +307,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         processor_kwargs["preprocessor_overrides"] = {
             "rename_observations_processor": {"rename_map": cfg.rename_map}
         }
-    # TODO check if this block is right (Jenny)
     postprocessor_kwargs["postprocessor_overrides"] = {
         "unnormalizer_processor": {
-            "stats": dataset.meta.stats,
+            "stats": renamed_stats,
             "features": policy.config.output_features,
             "norm_map": policy.config.normalization_mapping,
         },
@@ -549,7 +554,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     # These are any remaining keys in aggregated after popping the standard metrics
                     for metric_name, metric_value in aggregated.items():
                         if metric_name not in ("avg_max_reward", "n_episodes", "eval_ep_s", "video_paths"):
-                            wandb_log_dict[f"eval/{metric_name}"] = metric_value
+                            wandb_log_dict[metric_name] = metric_value
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
