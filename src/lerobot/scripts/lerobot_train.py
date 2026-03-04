@@ -490,14 +490,22 @@ def train(cfg: TrainPipelineConfig):
     processor_pretrained_path = active_cfg.pretrained_path
 
     processor_kwargs = ProcessorConfigKwargs()
+
+    # Apply rename_map to dataset stats keys so the normalizer can find them after the rename step.
+    # The rename step runs before normalization, so stats must be keyed by the post-rename names.
+    # e.g. "observation.images.base_rgb_letterbox" -> "observation.images.base_rgb"
+    renamed_stats = {cfg.rename_map.get(k, k): v for k, v in dataset.meta.stats.items()}
+
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
-        processor_kwargs["dataset_stats"] = dataset.meta.stats
+        processor_kwargs["dataset_stats"] = renamed_stats
+
     if cfg.is_reward_model_training:
         processor_kwargs["dataset_meta"] = dataset.meta
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
         preprocessor_overrides = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
+                "stats": renamed_stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -505,6 +513,7 @@ def train(cfg: TrainPipelineConfig):
         }
         postprocessor_overrides = {
             "unnormalizer_processor": {
+                "stats": renamed_stats,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -896,7 +905,7 @@ def train(cfg: TrainPipelineConfig):
                     # These are any remaining keys in aggregated after popping the standard metrics
                     for metric_name, metric_value in aggregated.items():
                         if metric_name not in ("avg_max_reward", "n_episodes", "eval_ep_s", "video_paths"):
-                            wandb_log_dict[f"eval/{metric_name}"] = metric_value
+                            wandb_log_dict[metric_name] = metric_value
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 

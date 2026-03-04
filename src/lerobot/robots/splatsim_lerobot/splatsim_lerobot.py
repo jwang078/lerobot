@@ -109,7 +109,7 @@ class SplatSimLerobot(Robot):
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
         # Create ZMQ robot client
-        self.robot_client = ZMQClientRobot(port=self.config.robot_port, host=self.config.hostname)
+        self.robot_client = ZMQClientRobot(port=self.config.port, host=self.config.hostname)
 
         # Don't create camera clients - SplatSim provides images through robot observations
         # The camera data comes embedded in the robot's get_obs() response
@@ -123,7 +123,7 @@ class SplatSimLerobot(Robot):
         )
 
         self._is_connected = True
-        logger.info(f"{self} connected to {self.config.hostname}:{self.config.robot_port}")
+        logger.info(f"{self} connected to {self.config.hostname}:{self.config.port}")
 
     @property
     def is_calibrated(self) -> bool:
