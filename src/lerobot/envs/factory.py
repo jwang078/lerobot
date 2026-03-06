@@ -204,21 +204,36 @@ def make_env(
             env_cls=env_cls,
         )
     elif "splatsim" in cfg.type:
-        from splatsim.gym_env import make_single_env
-
         if cfg.task is None:
             raise ValueError("SplatSimEnv requires a task to be specified")
 
-        # Debug: print the parameters being passed
-        splatsim_cfg = cfg.gym_kwargs.get("cfg", {})
         splatsim_render_mode = cfg.gym_kwargs.get("render_mode", "rgb_array")
 
-        def _make_splatsim():
-            return make_single_env(
-                cfg.task,
-                cfg=splatsim_cfg,
-                render_mode=splatsim_render_mode,
-            )
+        if getattr(cfg, "external_port", None) is not None:
+            from splatsim.gym_env import ZMQSplatSimGymEnv
+
+            def _make_splatsim():
+                return ZMQSplatSimGymEnv(
+                    host=cfg.external_host,
+                    port=cfg.external_port,
+                    camera_names=cfg.camera_names,
+                    image_resize_modes=cfg.image_resize_modes,
+                    num_dofs=6,
+                    image_height=cfg.observation_height,
+                    image_width=cfg.observation_width,
+                    render_mode=splatsim_render_mode,
+                )
+        else:
+            from splatsim.gym_env import make_single_env
+
+            splatsim_cfg = cfg.gym_kwargs.get("cfg", {})
+
+            def _make_splatsim():
+                return make_single_env(
+                    cfg.task,
+                    cfg=splatsim_cfg,
+                    render_mode=splatsim_render_mode,
+                )
 
         vec = env_cls(
             [_make_splatsim for _ in range(n_envs)],

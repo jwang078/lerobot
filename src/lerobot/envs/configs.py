@@ -422,6 +422,13 @@ class SplatSimEnv(EnvConfig):
 
     port: int | None = None
 
+    # Connect to an already-running SplatSim server instead of launching a new one.
+    # When set, lerobot-eval uses ZMQSplatSimGymEnv on this port rather than
+    # spawning a PybulletRobotServerBase. Useful for shared-autonomy eval where
+    # gello is also connected to the same running simulator.
+    external_port: int | None = None
+    external_host: str = "127.0.0.1"
+
     # Image dimensions
     observation_height: int = 224
     observation_width: int = 224
