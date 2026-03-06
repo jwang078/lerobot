@@ -531,6 +531,13 @@ class SplatSimEnv(EnvConfig):
 
     port: int | None = None
 
+    # Connect to an already-running SplatSim server instead of launching a new one.
+    # When set, lerobot-eval uses ZMQSplatSimGymEnv on this port rather than
+    # spawning a PybulletRobotServerBase. Useful for shared-autonomy eval where
+    # gello is also connected to the same running simulator.
+    external_port: int | None = None
+    external_host: str = "127.0.0.1"
+
     # Image dimensions
     observation_height: int = 224
     observation_width: int = 224
@@ -592,15 +599,38 @@ class SplatSimEnv(EnvConfig):
         }
 
     def create_envs(self, n_envs: int, use_async_envs: bool = False) -> dict:
-        from splatsim.gym_env import make_single_env
-
         env_cls = gym.vector.AsyncVectorEnv if (use_async_envs and n_envs > 1) else gym.vector.SyncVectorEnv
-        splatsim_cfg = self.gym_kwargs.get("cfg", {})
         splatsim_render_mode = self.gym_kwargs.get("render_mode", "rgb_array")
-        task = self.task
 
-        def _make_splatsim():
-            return make_single_env(task, cfg=splatsim_cfg, render_mode=splatsim_render_mode)
+        if self.external_port is not None:
+            from splatsim.gym_env import ZMQSplatSimGymEnv
+
+            external_host = self.external_host
+            external_port = self.external_port
+            camera_names = self.camera_names
+            image_resize_modes = self.image_resize_modes
+            observation_height = self.observation_height
+            observation_width = self.observation_width
+
+            def _make_splatsim():
+                return ZMQSplatSimGymEnv(
+                    host=external_host,
+                    port=external_port,
+                    camera_names=camera_names,
+                    image_resize_modes=image_resize_modes,
+                    num_dofs=6,
+                    image_height=observation_height,
+                    image_width=observation_width,
+                    render_mode=splatsim_render_mode,
+                )
+        else:
+            from splatsim.gym_env import make_single_env
+
+            splatsim_cfg = self.gym_kwargs.get("cfg", {})
+            task = self.task
+
+            def _make_splatsim():
+                return make_single_env(task, cfg=splatsim_cfg, render_mode=splatsim_render_mode)
 
         try:
             from gymnasium.vector import AutoresetMode
