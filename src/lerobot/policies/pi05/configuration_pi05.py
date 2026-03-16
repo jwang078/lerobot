@@ -17,11 +17,11 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
+from lerobot.configs.shared_autonomy import SharedAutonomyConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 from ..rtc.configuration_rtc import RTCConfig
-from .configuration_shared_autonomy import SharedAutonomyConfig
 
 DEFAULT_IMAGE_SIZE = 224
 
