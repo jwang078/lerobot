@@ -17,6 +17,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.shared_autonomy import SharedAutonomyConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
@@ -138,6 +139,9 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inference
     num_inference_steps: int | None = None
+
+    # Shared autonomy
+    shared_autonomy_config: SharedAutonomyConfig | None = None
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
