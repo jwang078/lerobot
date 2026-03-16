@@ -25,6 +25,8 @@ stateless; adopting them does not affect checkpoints.
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -69,6 +71,7 @@ def euler_integrate(
     prev_chunk_left_over: Tensor | None = None,
     execution_horizon: int | None = None,
     t_start: float = 1.0,
+    dt: float | None = None,
 ) -> Tensor:
     """Forward-Euler integration of a velocity field from t=1 (noise) to t=0 (actions).
 
@@ -92,15 +95,21 @@ def euler_integrate(
         execution_horizon: RTC guidance parameter, forwarded verbatim.
         t_start: Time to start integrating from. Defaults to 1.0 (pure noise).
             Shared autonomy sets this below 1.0 to preserve a partial forward
-            flow already applied to ``noise`` — integration then runs from
-            ``t_start`` to 0 over the same ``num_steps``.
+            flow already applied to ``noise``.
+        dt: Step size (negative). Defaults to ``-1/num_steps``. The number of
+            steps actually taken is ``ceil(t_start / -dt)``, so a t_start below
+            1 walks the SAME timestep grid the model was trained on and simply
+            takes fewer steps — rather than stretching dt to fit num_steps.
+            With the defaults this is exactly ``num_steps`` steps from t=1.
     """
     bsize = noise.shape[0]
     device = noise.device
 
-    dt = -t_start / num_steps
+    if dt is None:
+        dt = -1.0 / num_steps
+    n_steps = max(1, math.ceil(t_start / -dt))
     x_t = noise
-    for step in range(num_steps):
+    for step in range(n_steps):
         time = t_start + step * dt
         time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 

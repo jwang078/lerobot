@@ -659,16 +659,30 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             use_cache=True,
         )
 
-        # Shared autonomy: seed the sample with a partial forward flow of the
-        # human action and start integrating from t_sw instead of t=1. Falls
-        # through to the standard full-noise path when no human action is set.
+        # Shared autonomy: start Euler integration below t=1 when the sample
+        # already carries a partial forward flow (see euler_integrate(t_start=...)).
         t_start = 1.0
-        if self.sa_processor is not None and self.sa_processor.has_human_action():
+        # Initialize denoising parameters
+        sa_noise_ratio = kwargs.get("sa_noise_ratio")
+        if sa_noise_ratio is not None and noise is not None:
+            # Shared autonomy: noise already contains partially-noised human action,
+            # start denoising from t=sa_noise_ratio instead of t=1.0
+            # Note: Only do this if we are given the guidance noise. Otherwise, we do full denoising from pure noise
+            # Snap t_start to the nearest valid timestep to match the timesteps used during training
+            dt = -1.0 / num_steps
+            t_start = round(sa_noise_ratio / dt) * dt
+
+            # t_start = sa_noise_ratio
+            # dt = -sa_noise_ratio / num_steps
+        elif self.sa_processor is not None and self.sa_processor.has_human_action():
+            # Legacy SharedAutonomyProcessor path
             human_action = self.sa_processor.get_human_action()
             if human_action.device != device:
                 human_action = human_action.to(device)
             noise = self.sa_processor.compute_initial_state(noise, human_action)
-            t_start, _dt, num_steps = self.sa_processor.modify_denoising_params(num_steps)
+            t_start, dt, num_steps = self.sa_processor.modify_denoising_params(num_steps)
+        else:
+            dt = -1.0 / num_steps
 
         return euler_integrate(
             lambda input_x_t, current_timestep: self.denoise_step(
@@ -685,6 +699,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
             t_start=t_start,
+            dt=dt,
         )
 
     def denoise_step(
@@ -755,9 +770,7 @@ class PI05Policy(PreTrainedPolicy):
         self.init_shared_autonomy_processor()
 
         # Initialize the core PI05 model
-        self.model = PI05Pytorch(
-            config, rtc_processor=self.rtc_processor, sa_processor=self.sa_processor
-        )
+        self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor, sa_processor=self.sa_processor)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -987,10 +1000,7 @@ class PI05Policy(PreTrainedPolicy):
 
     def _sa_enabled(self) -> bool:
         """Check if shared autonomy is enabled."""
-        return (
-            self.config.shared_autonomy_config is not None
-            and self.config.shared_autonomy_config.enabled
-        )
+        return self.config.shared_autonomy_config is not None and self.config.shared_autonomy_config.enabled
 
     def set_human_action(self, human_action: Tensor):
         """Public API to provide human action input.
@@ -1005,9 +1015,7 @@ class PI05Policy(PreTrainedPolicy):
         if self.sa_processor is not None:
             self.sa_processor.set_human_action(human_action)
         else:
-            raise RuntimeError(
-                "Shared autonomy is not enabled. Set config.shared_autonomy_config to enable."
-            )
+            raise RuntimeError("Shared autonomy is not enabled. Set config.shared_autonomy_config to enable.")
 
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
@@ -1081,7 +1089,7 @@ class PI05Policy(PreTrainedPolicy):
         return actions
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         """Select a single action given environment observations."""
         assert not self._rtc_enabled(), (
             "RTC is not supported for select_action, use it with predict_action_chunk"
@@ -1091,7 +1099,7 @@ class PI05Policy(PreTrainedPolicy):
 
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            actions = self.predict_action_chunk(batch, **kwargs)[:, : self.config.n_action_steps]
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
