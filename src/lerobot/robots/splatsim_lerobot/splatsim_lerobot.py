@@ -78,9 +78,14 @@ class SplatSimLerobot(Robot):
         """Define observation space"""
         features = {}
 
-        # Add each configured camera
+        # Add each configured camera (with resize mode suffix to match get_observation keys)
         for camera_name in self.config.camera_names:
-            features[f"images.{camera_name}"] = (self.config.image_height, self.config.image_width, 3)
+            for image_resize_mode in self.config.image_resize_modes:
+                features[f"{camera_name}_{image_resize_mode}"] = (
+                    self.config.image_height,
+                    self.config.image_width,
+                    3,
+                )
 
         # Add individual state features for each joint (LeRobot expects named joints)
         for joint_name in self.config.joint_names:
@@ -153,21 +158,30 @@ class SplatSimLerobot(Robot):
         for camera_name in self.config.camera_names:
             for image_resize_mode in self.config.image_resize_modes:
                 key = f"{camera_name}_{image_resize_mode}"
-                img = obs.get(camera_name)
-                if img is not None:
-                    # Convert to numpy if needed
+                if key in obs:
+                    img = obs[key]
                     if isinstance(img, torch.Tensor):
                         img = img.detach().cpu().numpy()
+                    # (C, H, W) -> (H, W, C)
+                    if img.ndim == 3 and img.shape[0] <= 4:
+                        img = img.transpose(1, 2, 0)
+                    lerobot_obs[key] = img
+                else:
+                    img = obs.get(camera_name)
+                    if img is not None:
+                        # Convert to numpy if needed
+                        if isinstance(img, torch.Tensor):
+                            img = img.detach().cpu().numpy()
 
-                    # Resize to configured size using configured mode
-                    img_resized = resize_image(
-                        img,
-                        output_size=(self.config.image_height, self.config.image_width),
-                        mode=image_resize_mode,
-                    )
-                    # Change from (C, H, W) to (H, W, C)
-                    lerobot_obs[key] = img_resized.transpose(1, 2, 0)
-            else:
+                        # Resize to configured size using configured mode
+                        img_resized = resize_image(
+                            img,
+                            output_size=(self.config.image_height, self.config.image_width),
+                            mode=image_resize_mode,
+                        )
+                        # Change from (C, H, W) to (H, W, C)
+                        lerobot_obs[key] = img_resized.transpose(1, 2, 0)
+            if not any(k for k in lerobot_obs if k.startswith(camera_name)):
                 logger.warning(f"No {camera_name} in observation!")
 
         # Process joint positions (state)
@@ -190,7 +204,7 @@ class SplatSimLerobot(Robot):
             # Add individual joint states (LeRobot expects named joints, not a single array)
             for i, joint_name in enumerate(self.config.joint_names):
                 if i < len(joint_positions):
-                    lerobot_obs[f"{joint_name}"] = float(joint_positions[i])
+                    lerobot_obs[f"state.{joint_name}"] = float(joint_positions[i])
 
         return lerobot_obs
 
