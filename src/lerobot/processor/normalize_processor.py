@@ -371,9 +371,12 @@ class _NormalizationMixin:
                 )
 
             denom = q99 - q01
-            # Avoid division by zero by adding epsilon when quantiles are identical
+            # Avoid division by zero/near-zero when quantiles are identical or nearly so
+            # (e.g. a dimension with zero variance in training data produces q99-q01 ~ 1e-14)
             denom = torch.where(
-                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
+                denom.abs() < self.eps,
+                torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype),
+                denom,
             )
             if inverse:
                 return (tensor + 1.0) * denom / 2.0 + q01
@@ -388,9 +391,11 @@ class _NormalizationMixin:
                 )
 
             denom = q90 - q10
-            # Avoid division by zero by adding epsilon when quantiles are identical
+            # Avoid division by zero/near-zero when quantiles are identical or nearly so
             denom = torch.where(
-                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
+                denom.abs() < self.eps,
+                torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype),
+                denom,
             )
             if inverse:
                 return (tensor + 1.0) * denom / 2.0 + q10
