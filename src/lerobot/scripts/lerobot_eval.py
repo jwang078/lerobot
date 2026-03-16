@@ -758,6 +758,13 @@ def eval_one(
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
     )
+    if "episode_length" in info_metrics and "truncated" in info_metrics:
+        info_metrics["episode_length_without_truncation"] = [
+            ep_len if not truncated else float("nan")
+            for ep_len, truncated in zip(
+                info_metrics["episode_length"], info_metrics["truncated"], strict=True
+            )
+        ]
     if info_metrics:
         result["info_metrics"] = info_metrics
     return result
