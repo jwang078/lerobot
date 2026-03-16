@@ -107,6 +107,13 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
     if "camera_obs" in observations:
         return_observations[f"{OBS_STR}.camera_obs"] = observations["camera_obs"]
 
+    # Pass through policy_guidance_action for shared autonomy
+    if "policy_guidance_action" in observations:
+        pga = torch.from_numpy(observations["policy_guidance_action"]).float()
+        if pga.dim() == 1:
+            pga = pga.unsqueeze(0)
+        return_observations[f"{OBS_STR}.policy_guidance_action"] = pga
+
     return return_observations
 
 
@@ -139,7 +146,10 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("once", UserWarning)  # Apply filter only in this function
 
-        if not (hasattr(env.envs[0], "task_description") and hasattr(env.envs[0], "task")):
+        has_task_desc = hasattr(env.envs[0], "task_description") or hasattr(
+            env.envs[0], "get_task_description"
+        )
+        if not (has_task_desc and (hasattr(env.envs[0], "task") or has_task_desc)):
             warnings.warn(
                 "The environment does not have 'task_description' and 'task'. Some policies require these features.",
                 UserWarning,
@@ -165,6 +175,18 @@ def add_envs_task(env: gym.vector.VectorEnv, observation: RobotObservation) -> R
             raise TypeError(f"Expected task_description to return a list, got {type(task_result)}")
         if not all(isinstance(item, str) for item in task_result):
             raise TypeError("All items in task_description result must be strings")
+
+        observation["task"] = task_result
+    elif hasattr(env.envs[0], "get_task_description"):
+        task_result = env.call("get_task_description")
+
+        if isinstance(task_result, tuple):
+            task_result = list(task_result)
+
+        if not isinstance(task_result, list):
+            raise TypeError(f"Expected get_task_description to return a list, got {type(task_result)}")
+        if not all(isinstance(item, str) for item in task_result):
+            raise TypeError("All items in get_task_description result must be strings")
 
         observation["task"] = task_result
     elif hasattr(env.envs[0], "task"):
