@@ -107,6 +107,13 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
     if "camera_obs" in observations:
         return_observations[f"{OBS_STR}.camera_obs"] = observations["camera_obs"]
 
+    # Pass through policy_guidance_action for shared autonomy
+    if "policy_guidance_action" in observations:
+        pga = torch.from_numpy(observations["policy_guidance_action"]).float()
+        if pga.dim() == 1:
+            pga = pga.unsqueeze(0)
+        return_observations[f"{OBS_STR}.policy_guidance_action"] = pga
+
     return return_observations
 
 
@@ -198,12 +205,65 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("once", UserWarning)
 
-        if not (_sub_env_has_attr(env, "task_description") and _sub_env_has_attr(env, "task")):
+        has_task_desc = _sub_env_has_attr(env, "task_description") or _sub_env_has_attr(
+            env, "get_task_description"
+        )
+        if not (has_task_desc and (_sub_env_has_attr(env, "task") or has_task_desc)):
             warnings.warn(
                 "The environment does not have 'task_description' and 'task'. Some policies require these features.",
                 UserWarning,
                 stacklevel=2,
             )
+        if not are_all_envs_same_type(env):
+            warnings.warn(
+                "The environments have different types. Make sure you infer the right task from each environment. Empty task will be passed instead.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+
+def add_envs_task(env: gym.vector.VectorEnv, observation: RobotObservation) -> RobotObservation:
+    """Adds task feature to the observation dict with respect to the first environment attribute."""
+    if _sub_env_has_attr(env, "task_description"):
+        task_result = env.call("task_description")
+
+        if isinstance(task_result, tuple):
+            task_result = list(task_result)
+
+        if not isinstance(task_result, list):
+            raise TypeError(f"Expected task_description to return a list, got {type(task_result)}")
+        if not all(isinstance(item, str) for item in task_result):
+            raise TypeError("All items in task_description result must be strings")
+
+        observation["task"] = task_result
+    elif _sub_env_has_attr(env, "get_task_description"):
+        task_result = env.call("get_task_description")
+
+        if isinstance(task_result, tuple):
+            task_result = list(task_result)
+
+        if not isinstance(task_result, list):
+            raise TypeError(f"Expected get_task_description to return a list, got {type(task_result)}")
+        if not all(isinstance(item, str) for item in task_result):
+            raise TypeError("All items in get_task_description result must be strings")
+
+        observation["task"] = task_result
+    elif _sub_env_has_attr(env, "task"):
+        task_result = env.call("task")
+
+        if isinstance(task_result, tuple):
+            task_result = list(task_result)
+
+        if not isinstance(task_result, list):
+            raise TypeError(f"Expected task to return a list, got {type(task_result)}")
+        if not all(isinstance(item, str) for item in task_result):
+            raise TypeError("All items in task result must be strings")
+
+        observation["task"] = task_result
+    else:  #  For envs without language instructions, e.g. aloha transfer cube and etc.
+        num_envs = observation[list(observation.keys())[0]].shape[0]
+        observation["task"] = ["" for _ in range(num_envs)]
+    return observation
 
 
 def _close_single_env(env: Any) -> None:
