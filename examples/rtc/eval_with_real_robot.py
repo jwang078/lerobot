@@ -279,12 +279,12 @@ def get_actions(
                 for name in obs_with_policy_features:
                     obs_with_policy_features[name] = torch.from_numpy(obs_with_policy_features[name])
                     if "image" in name:
-                        obs_with_policy_features[name] = (
-                            obs_with_policy_features[name].type(torch.float32) / 255
-                        )
-                        obs_with_policy_features[name] = (
-                            obs_with_policy_features[name].permute(2, 0, 1).contiguous()
-                        )
+                        img_tensor = obs_with_policy_features[name]
+                        if img_tensor.dtype == torch.uint8:
+                            img_tensor = img_tensor.type(torch.float32) / 255
+                        else:
+                            img_tensor = img_tensor.type(torch.float32)
+                        obs_with_policy_features[name] = img_tensor.permute(2, 0, 1).contiguous()
                     obs_with_policy_features[name] = obs_with_policy_features[name].unsqueeze(0)
                     obs_with_policy_features[name] = obs_with_policy_features[name].to(policy_device)
 
