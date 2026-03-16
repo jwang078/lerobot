@@ -538,7 +538,134 @@ def make_policy(
         validate_visual_features_consistency(cfg, features)
         # TODO: (jadechoghari) - add a check_state(cfg, features) and check_action(cfg, features)
 
+    # Wrap with shared autonomy if enabled
+    sa_cfg = getattr(cfg, "shared_autonomy_config", None)
+    if sa_cfg is not None and sa_cfg.enabled:
+        policy = _wrap_with_shared_autonomy(policy, cfg, sa_cfg)
+
     return policy
+
+
+def _wrap_with_shared_autonomy(policy, cfg, sa_cfg):
+    """Wrap a policy with SharedAutonomyPolicyWrapper.
+
+    Builds an inverse postprocessor (raw action → normalized action) by loading
+    the postprocessor from the pretrained checkpoint and extracting its stats.
+    """
+    from lerobot.policies.shared_autonomy_wrapper import SharedAutonomyPolicyWrapper
+    from lerobot.processor.device_processor import DeviceProcessorStep
+    from lerobot.processor.normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+
+    # Load the postprocessor from pretrained to get normalization stats
+    pretrained_path = cfg.pretrained_path
+    if pretrained_path is None:
+        raise ValueError(
+            "Shared autonomy requires a pretrained model (need normalization stats). "
+            "Set pretrained_path in the policy config."
+        )
+
+    postprocessor = PolicyProcessorPipeline.from_pretrained(
+        pretrained_model_name_or_path=pretrained_path,
+        config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+
+    # Extract features, norm_map, and stats from the postprocessor's UnnormalizerProcessorStep.
+    # We use the postprocessor's own config rather than cfg.output_features so that the
+    # features and stats keys are guaranteed to match (important when rename_map is used
+    # during training and obs keys get renamed in the saved stats).
+    postprocessor_features = None
+    postprocessor_norm_map = None
+    postprocessor_stats = None
+    for step in postprocessor.steps:
+        if hasattr(step, "stats") and step.stats:
+            postprocessor_features = getattr(step, "features", None)
+            postprocessor_norm_map = getattr(step, "norm_map", None)
+            postprocessor_stats = step.stats
+            break
+
+    if postprocessor_stats is None:
+        logging.warning(
+            "Could not extract normalization stats from postprocessor. "
+            "Inverse postprocessor will not normalize human actions."
+        )
+
+    # Fall back to cfg values if we couldn't extract from postprocessor
+    features = postprocessor_features or cfg.output_features
+    norm_map = postprocessor_norm_map or cfg.normalization_mapping
+
+    # Build inverse postprocessor: normalizes raw actions to policy's internal space
+    inverse_steps = [
+        NormalizerProcessorStep(
+            features=features,
+            norm_map=norm_map,
+            stats=postprocessor_stats,
+        ),
+        DeviceProcessorStep(device=cfg.device),
+    ]
+    inverse_postprocessor = PolicyProcessorPipeline(
+        steps=inverse_steps,
+        name="inverse_postprocessor",
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+
+    # Load preprocessor to get observation.state normalization stats
+    preprocessor = PolicyProcessorPipeline.from_pretrained(
+        pretrained_model_name_or_path=pretrained_path,
+        config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+
+    preprocessor_features = None
+    preprocessor_norm_map = None
+    preprocessor_stats = None
+    for step in preprocessor.steps:
+        if hasattr(step, "stats") and step.stats:
+            preprocessor_features = getattr(step, "features", None)
+            preprocessor_norm_map = getattr(step, "norm_map", None)
+            preprocessor_stats = step.stats
+            break
+
+    # Build inverse_preprocessor: normalized obs.state → raw joint values
+    inverse_preprocessor = None
+    if preprocessor_stats is not None:
+        inverse_preprocessor = PolicyProcessorPipeline(
+            steps=[
+                UnnormalizerProcessorStep(
+                    features=preprocessor_features or cfg.input_features,
+                    norm_map=preprocessor_norm_map or cfg.normalization_mapping,
+                    stats=preprocessor_stats,
+                ),
+                DeviceProcessorStep(device=cfg.device),
+            ],
+            name="inverse_preprocessor",
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
+        )
+    else:
+        logging.warning(
+            "Could not extract normalization stats from preprocessor. "
+            "IK will use raw (possibly wrong) obs.state values."
+        )
+
+    wrapped = SharedAutonomyPolicyWrapper(
+        inner_policy=policy,
+        inverse_postprocessor=inverse_postprocessor,
+        postprocessor=postprocessor,
+        inverse_preprocessor=inverse_preprocessor,
+        forward_flow_ratio=sa_cfg.forward_flow_ratio,
+        show_slider=sa_cfg.show_slider,
+        robot_name=sa_cfg.robot_name,
+        max_joint_delta=sa_cfg.max_joint_delta,
+        num_dofs=sa_cfg.num_dofs,
+    )
+    logging.info(
+        f"Wrapped policy with SharedAutonomyPolicyWrapper (forward_flow_ratio={sa_cfg.forward_flow_ratio})"
+    )
+    return wrapped
 
 
 def _get_policy_cls_from_policy_name(name: str) -> type[PreTrainedConfig]:
