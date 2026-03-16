@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from lerobot.configs.shared_autonomy import SharedAutonomyConfig
+
 from .configuration_pi05 import PI05Config
-from .configuration_shared_autonomy import SharedAutonomyConfig
 from .modeling_pi05 import PI05Policy
 from .modeling_shared_autonomy import SharedAutonomyProcessor
 from .processor_pi05 import make_pi05_pre_post_processors
