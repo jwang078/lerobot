@@ -144,6 +144,7 @@ def serialize_dict(stats: dict[str, torch.Tensor | np.ndarray | dict]) -> dict:
     return unflatten_dict(serialized_dict)
 
 
+
 def is_valid_version(version: str) -> bool:
     """Check if a string is a valid PEP 440 version.
 

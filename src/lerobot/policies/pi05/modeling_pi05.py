@@ -838,12 +838,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # Shared autonomy: noise already contains partially-noised human action,
             # start denoising from t=sa_noise_ratio instead of t=1.0
             # Note: Only do this if we are given the guidance noise. Otherwise, we do full denoising from pure noise
-            # Snap t_start to the nearest valid timestep to match the timesteps used during training
-            dt = -1.0 / num_steps
-            t_start = round(sa_noise_ratio / dt) * dt
 
-            # t_start = sa_noise_ratio
-            # dt = -sa_noise_ratio / num_steps
+            # # Snap t_start to the nearest valid timestep to match the timesteps used during training
+            # dt = -1.0 / num_steps
+            # t_start = round(sa_noise_ratio / dt) * dt
+
+            t_start = sa_noise_ratio
+            dt = -sa_noise_ratio / num_steps
         elif self.sa_processor is not None and self.sa_processor.has_human_action():
             # Legacy SharedAutonomyProcessor path
             human_action = self.sa_processor.get_human_action()
@@ -856,10 +857,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             dt = -1.0 / num_steps
         x_t = noise
 
-        actual_num_steps = int(torch.ceil(torch.tensor((t_start - 0.0) / (-dt))).item())
+        # actual_num_steps = int(torch.ceil(torch.tensor((t_start - 0.0) / (-dt))).item())
         print(
-            "action num steps:",
-            actual_num_steps,
+            # "action num steps:",
+            # actual_num_steps,
             "sa_noise_ratio:",
             sa_noise_ratio,
             "t_start:",
@@ -867,7 +868,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             "dt:",
             dt,
         )
-        for step in range(actual_num_steps):
+        # for step in range(actual_num_steps):
+        for step in range(num_steps):
             time = t_start + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 

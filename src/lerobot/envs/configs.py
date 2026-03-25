@@ -531,6 +531,16 @@ class SplatSimEnv(EnvConfig):
 
     port: int | None = None
 
+    # Run in eval_benchmark mode: restore pre-recorded episode scenarios on each reset().
+    # Set to the LeRobot repo ID (e.g. "user/my-eval-dataset") of the dataset whose
+    # episode scenarios should be cycled through. Each env.reset() advances to the next episode.
+    eval_benchmark_repo_id: str | None = None
+
+    # Optional subset of episode indices to evaluate in eval_benchmark mode.
+    # If None, all episodes in the dataset are used (0..N-1).
+    # Example: [3, 8, 23, 38] to evaluate only those episodes from the benchmark dataset.
+    eval_benchmark_subset: list[int] | None = None
+
     # Connect to an already-running SplatSim server instead of launching a new one.
     # When set, lerobot-eval uses ZMQSplatSimGymEnv on this port rather than
     # spawning a PybulletRobotServerBase. Useful for shared-autonomy eval where
@@ -593,6 +603,11 @@ class SplatSimEnv(EnvConfig):
         # Include task_description if provided (for language-conditioned policies)
         if self.task_description is not None:
             cfg["task_description"] = self.task_description
+        # Pass eval_benchmark_repo_id so the robot server loads the dataset on startup
+        if self.eval_benchmark_repo_id is not None:
+            cfg["eval_benchmark_repo_id"] = self.eval_benchmark_repo_id
+        if self.eval_benchmark_subset is not None:
+            cfg["eval_benchmark_subset"] = self.eval_benchmark_subset
         return {
             "cfg": cfg,
             "render_mode": self.render_mode,
@@ -625,18 +640,30 @@ class SplatSimEnv(EnvConfig):
                 )
         else:
             from splatsim.gym_env import make_single_env
+            from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
 
             splatsim_cfg = self.gym_kwargs.get("cfg", {})
             task = self.task
+            splatsim_serve_mode = (
+                PybulletRobotServerBase.SERVE_MODES.EVAL_BENCHMARK
+                if self.eval_benchmark_repo_id is not None
+                else PybulletRobotServerBase.SERVE_MODES.INTERACTIVE
+            )
 
             def _make_splatsim():
-                return make_single_env(task, cfg=splatsim_cfg, render_mode=splatsim_render_mode)
+                return make_single_env(
+                    task, cfg=splatsim_cfg, render_mode=splatsim_render_mode, serve_mode=splatsim_serve_mode
+                )
 
         try:
             from gymnasium.vector import AutoresetMode
 
             vec = env_cls(
-                [_make_splatsim for _ in range(n_envs)], autoreset_mode=AutoresetMode.SAME_STEP
+                [_make_splatsim for _ in range(n_envs)],
+                # NEXT_STEP: on the termination step, final_info is populated (needed by lerobot_eval
+                # to read is_success). The actual auto-reset fires on the *next* step call, which
+                # never happens since the rollout loop exits on done=True.
+                autoreset_mode=AutoresetMode.NEXT_STEP,
             )
         except ImportError:
             vec = env_cls([_make_splatsim for _ in range(n_envs)])

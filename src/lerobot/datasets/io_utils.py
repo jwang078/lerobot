@@ -220,10 +220,15 @@ def write_episodes(episodes: Dataset, local_dir: Path) -> None:
 
 
 def load_episodes(local_dir: Path) -> datasets.Dataset:
-    episodes = load_nested_dataset(local_dir / EPISODES_DIR)
-    # Select episode features/columns containing references to episode data and videos
-    # (e.g. tasks, dataset_from_index, dataset_to_index, data/chunk_index, data/file_index, etc.)
-    # This is to speedup access to these data, instead of having to load episode stats.
+    pq_dir = local_dir / EPISODES_DIR
+    paths = sorted(pq_dir.glob("*/*.parquet"))
+    if len(paths) == 0:
+        raise FileNotFoundError(f"Provided directory does not contain any parquet file: {pq_dir}")
+    # Use pa_ds.dataset which unifies schemas across files (handles mixed extra columns
+    # from different dataset versions), then load into memory — episodes metadata is small.
+    table = pa_ds.dataset(paths, format="parquet").to_table()
+    episodes = datasets.Dataset(table)
+    # Drop stats columns to speed up access
     episodes = episodes.select_columns([key for key in episodes.features if not key.startswith("stats/")])
     return episodes
 

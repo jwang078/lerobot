@@ -672,6 +672,7 @@ def eval_main(cfg: EvalPipelineConfig):
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            output_dir=Path(cfg.output_dir),
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -830,6 +831,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    output_dir: Path | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -851,6 +853,22 @@ def eval_policy_all(
     # Track custom info metrics separately (dynamic keys)
     group_info_metrics: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     overall_info_metrics: dict[str, list] = defaultdict(list)
+
+    def _json_default(obj):
+        if isinstance(obj, np.generic):
+            return obj.item()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+    def _save_partial_snapshot():
+        if output_dir is None:
+            return
+        snapshot = {
+            "per_task": list(per_task_infos),
+            "partial": True,
+        }
+        out_path = output_dir / "eval_info.json"
+        with open(out_path, "w") as f:
+            json.dump(snapshot, f, indent=2, default=_json_default)
 
     # small inline helper to accumulate one task's metrics into accumulators
     def _accumulate_to(group: str, metrics: dict):
@@ -912,6 +930,7 @@ def eval_policy_all(
                 tg, tid, metrics = task_runner(task_group, task_id, env)
                 _accumulate_to(tg, metrics)
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                _save_partial_snapshot()
             finally:
                 env.close()
                 # Prefetch next task's workers *after* closing current env to prevent
@@ -933,6 +952,7 @@ def eval_policy_all(
                     tg, tid, metrics = fut.result()
                     _accumulate_to(tg, metrics)
                     per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                    _save_partial_snapshot()
                 finally:
                     env.close()
 
