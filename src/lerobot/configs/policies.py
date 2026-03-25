@@ -54,6 +54,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     """
 
     n_obs_steps: int = 1
+    n_action_steps: int = 1
 
     # `input_features` can be set to None/null in order to infer those values from the dataset.
     input_features: dict[str, PolicyFeature] | None = field(default_factory=dict)

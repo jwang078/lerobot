@@ -225,19 +225,30 @@ def make_env(
                 )
         else:
             from splatsim.gym_env import make_single_env
+            from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
 
             splatsim_cfg = cfg.gym_kwargs.get("cfg", {})
+            splatsim_serve_mode = (
+                PybulletRobotServerBase.SERVE_MODES.EVAL_BENCHMARK
+                if getattr(cfg, "eval_benchmark_repo_id", None) is not None
+                else PybulletRobotServerBase.SERVE_MODES.INTERACTIVE
+            )
 
             def _make_splatsim():
                 return make_single_env(
                     cfg.task,
                     cfg=splatsim_cfg,
                     render_mode=splatsim_render_mode,
+                    serve_mode=splatsim_serve_mode,
                 )
 
         vec = env_cls(
             [_make_splatsim for _ in range(n_envs)],
-            autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
+            # NEXT_STEP: on the termination step, final_info is populated (needed by lerobot_eval
+            # to read is_success). The actual auto-reset fires on the *next* step call, which
+            # never happens since the rollout loop exits on done=True and lerobot calls
+            # env.reset() explicitly at the start of each new batch.
+            autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP,
         )
         return {"splatsim": {0: vec}}
 

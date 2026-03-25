@@ -422,6 +422,16 @@ class SplatSimEnv(EnvConfig):
 
     port: int | None = None
 
+    # Run in eval_benchmark mode: restore pre-recorded episode scenarios on each reset().
+    # Set to the LeRobot repo ID (e.g. "user/my-eval-dataset") of the dataset whose
+    # episode scenarios should be cycled through. Each env.reset() advances to the next episode.
+    eval_benchmark_repo_id: str | None = None
+
+    # Optional subset of episode indices to evaluate in eval_benchmark mode.
+    # If None, all episodes in the dataset are used (0..N-1).
+    # Example: [3, 8, 23, 38] to evaluate only those episodes from the benchmark dataset.
+    eval_benchmark_subset: list[int] | None = None
+
     # Connect to an already-running SplatSim server instead of launching a new one.
     # When set, lerobot-eval uses ZMQSplatSimGymEnv on this port rather than
     # spawning a PybulletRobotServerBase. Useful for shared-autonomy eval where
@@ -484,6 +494,11 @@ class SplatSimEnv(EnvConfig):
         # Include task_description if provided (for language-conditioned policies)
         if self.task_description is not None:
             cfg["task_description"] = self.task_description
+        # Pass eval_benchmark_repo_id so the robot server loads the dataset on startup
+        if self.eval_benchmark_repo_id is not None:
+            cfg["eval_benchmark_repo_id"] = self.eval_benchmark_repo_id
+        if self.eval_benchmark_subset is not None:
+            cfg["eval_benchmark_subset"] = self.eval_benchmark_subset
         return {
             "cfg": cfg,
             "render_mode": self.render_mode,
