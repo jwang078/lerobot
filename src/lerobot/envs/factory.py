@@ -212,8 +212,25 @@ def make_env(
         if getattr(cfg, "external_port", None) is not None:
             from splatsim.gym_env import ZMQSplatSimGymEnv
 
+            # Set up teleop recording if configured
+            teleop_context = None
+            teleop_dataset = None
+            if cfg.teleop_dataset_repo_id is not None:
+                from splatsim.configs.mode_config import ImageResizeMode
+                from splatsim.utils.lerobot_utils import create_lerobot_dataset, load_lerobot_dataset
+
+                from lerobot.policies.teleop_recording import TeleopRecordingContext
+
+                teleop_context = TeleopRecordingContext.get_instance()
+                image_keys = [f"{cam}_{mode.value}" for cam in cfg.camera_names for mode in ImageResizeMode]
+                teleop_dataset = load_lerobot_dataset(cfg.teleop_dataset_repo_id)
+                if teleop_dataset is None:
+                    teleop_dataset = create_lerobot_dataset(
+                        cfg.teleop_dataset_repo_id, fps=cfg.fps, image_keys=image_keys
+                    )
+
             def _make_splatsim():
-                return ZMQSplatSimGymEnv(
+                env = ZMQSplatSimGymEnv(
                     host=cfg.external_host,
                     port=cfg.external_port,
                     camera_names=cfg.camera_names,
@@ -222,7 +239,20 @@ def make_env(
                     image_height=cfg.observation_height,
                     image_width=cfg.observation_width,
                     render_mode=splatsim_render_mode,
+                    max_episode_steps=cfg.episode_length,
                 )
+                if teleop_context is not None and teleop_dataset is not None:
+                    from lerobot.policies.teleop_recording import TeleopRecordingWrapper
+
+                    env = TeleopRecordingWrapper(
+                        env,
+                        context=teleop_context,
+                        dataset=teleop_dataset,
+                        image_keys=image_keys,
+                        task=cfg.task,
+                        min_episode_length=cfg.teleop_min_episode_length,
+                    )
+                return env
         else:
             from splatsim.gym_env import make_single_env
             from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase

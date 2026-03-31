@@ -439,6 +439,11 @@ class SplatSimEnv(EnvConfig):
     external_port: int | None = None
     external_host: str = "127.0.0.1"
 
+    # Teleop recording: save pure-teleop (ratio=0) segments to a LeRobot dataset.
+    # Set to a repo ID (e.g. "user/teleop-data") to enable; None to disable.
+    teleop_dataset_repo_id: str | None = None
+    teleop_min_episode_length: int = 60  # discard segments shorter than this
+
     # Image dimensions
     observation_height: int = 224
     observation_width: int = 224

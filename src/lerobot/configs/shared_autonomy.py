@@ -49,6 +49,7 @@ class SharedAutonomyConfig:
     policy_guidance_action_buffer_size: int = 1
     apply_to_first_action_only: bool = True
     show_slider: bool = False  # launch a Tkinter slider to adjust forward_flow_ratio live
+    start_paused: bool = False  # start with policy paused (unpause via GUI button)
     robot_name: str = "robot_iphone_w_engine_new"
     max_joint_delta: float = 0.02
     num_dofs: int = 6
