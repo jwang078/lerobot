@@ -120,3 +120,4 @@ def make_env(
         raise ValueError("`n_envs` must be at least 1")
 
     return cfg.create_envs(n_envs=n_envs, use_async_envs=use_async_envs)
+

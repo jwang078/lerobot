@@ -702,10 +702,18 @@ def _wrap_with_shared_autonomy(policy, cfg, sa_cfg):
         inverse_preprocessor=inverse_preprocessor,
         forward_flow_ratio=sa_cfg.forward_flow_ratio,
         show_slider=sa_cfg.show_slider,
+        start_paused=sa_cfg.start_paused,
         robot_name=sa_cfg.robot_name,
         max_joint_delta=sa_cfg.max_joint_delta,
         num_dofs=sa_cfg.num_dofs,
     )
+
+    # Connect shared context for teleop recording (if active)
+    from lerobot.policies.teleop_recording import TeleopRecordingContext
+
+    ctx = TeleopRecordingContext.get_instance()
+    wrapped._teleop_context = ctx
+
     logging.info(
         f"Wrapped policy with SharedAutonomyPolicyWrapper (forward_flow_ratio={sa_cfg.forward_flow_ratio})"
     )

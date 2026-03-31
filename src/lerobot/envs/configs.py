@@ -548,6 +548,11 @@ class SplatSimEnv(EnvConfig):
     external_port: int | None = None
     external_host: str = "127.0.0.1"
 
+    # Teleop recording: save pure-teleop (ratio=0) segments to a LeRobot dataset.
+    # Set to a repo ID (e.g. "user/teleop-data") to enable; None to disable.
+    teleop_dataset_repo_id: str | None = None
+    teleop_min_episode_length: int = 60  # discard segments shorter than this
+
     # Image dimensions
     observation_height: int = 224
     observation_width: int = 224
@@ -620,15 +625,38 @@ class SplatSimEnv(EnvConfig):
         if self.external_port is not None:
             from splatsim.gym_env import ZMQSplatSimGymEnv
 
+            # Set up teleop recording if configured
+            teleop_context = None
+            teleop_dataset = None
+            image_keys = None
+            if self.teleop_dataset_repo_id is not None:
+                from splatsim.configs.mode_config import ImageResizeMode
+                from splatsim.utils.lerobot_utils import create_lerobot_dataset, load_lerobot_dataset
+
+                from lerobot.policies.teleop_recording import TeleopRecordingContext
+
+                teleop_context = TeleopRecordingContext.get_instance()
+                image_keys = [
+                    f"{cam}_{mode.value}" for cam in self.camera_names for mode in ImageResizeMode
+                ]
+                teleop_dataset = load_lerobot_dataset(self.teleop_dataset_repo_id)
+                if teleop_dataset is None:
+                    teleop_dataset = create_lerobot_dataset(
+                        self.teleop_dataset_repo_id, fps=self.fps, image_keys=image_keys
+                    )
+
             external_host = self.external_host
             external_port = self.external_port
             camera_names = self.camera_names
             image_resize_modes = self.image_resize_modes
             observation_height = self.observation_height
             observation_width = self.observation_width
+            episode_length = self.episode_length
+            task = self.task
+            teleop_min_episode_length = self.teleop_min_episode_length
 
             def _make_splatsim():
-                return ZMQSplatSimGymEnv(
+                env = ZMQSplatSimGymEnv(
                     host=external_host,
                     port=external_port,
                     camera_names=camera_names,
@@ -637,7 +665,20 @@ class SplatSimEnv(EnvConfig):
                     image_height=observation_height,
                     image_width=observation_width,
                     render_mode=splatsim_render_mode,
+                    max_episode_steps=episode_length,
                 )
+                if teleop_context is not None and teleop_dataset is not None:
+                    from lerobot.policies.teleop_recording import TeleopRecordingWrapper
+
+                    env = TeleopRecordingWrapper(
+                        env,
+                        context=teleop_context,
+                        dataset=teleop_dataset,
+                        image_keys=image_keys,
+                        task=task,
+                        min_episode_length=teleop_min_episode_length,
+                    )
+                return env
         else:
             from splatsim.gym_env import make_single_env
             from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
