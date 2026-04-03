@@ -541,12 +541,12 @@ def make_policy(
     # Wrap with shared autonomy if enabled
     sa_cfg = getattr(cfg, "shared_autonomy_config", None)
     if sa_cfg is not None and sa_cfg.enabled:
-        policy = _wrap_with_shared_autonomy(policy, cfg, sa_cfg)
+        policy = _wrap_with_shared_autonomy(policy, cfg)
 
     return policy
 
 
-def _wrap_with_shared_autonomy(policy, cfg, sa_cfg):
+def _wrap_with_shared_autonomy(policy, cfg):
     """Wrap a policy with SharedAutonomyPolicyWrapper.
 
     Builds an inverse postprocessor (raw action → normalized action) by loading
@@ -555,6 +555,8 @@ def _wrap_with_shared_autonomy(policy, cfg, sa_cfg):
     from lerobot.policies.shared_autonomy_wrapper import SharedAutonomyPolicyWrapper
     from lerobot.processor.device_processor import DeviceProcessorStep
     from lerobot.processor.normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+
+    sa_cfg = cfg.shared_autonomy_config
 
     # Load the postprocessor from pretrained to get normalization stats
     pretrained_path = cfg.pretrained_path
