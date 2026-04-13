@@ -221,6 +221,7 @@ class DiffusionModel(nn.Module):
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
         sa_noise_ratio: float | None = None,
+        anchor_action: Tensor | None = None,
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -249,7 +250,9 @@ class DiffusionModel(nn.Module):
             start_step_idx = max(0, min(start_step_idx, len(timesteps) - 1))
             timesteps = timesteps[start_step_idx:]
 
-        for t in timesteps:
+        act_start = self.config.n_obs_steps - 1  # action steps begin here in the sample tensor
+
+        for i, t in enumerate(timesteps):
             # Predict model output.
             model_output = self.unet(
                 sample,
@@ -258,6 +261,18 @@ class DiffusionModel(nn.Module):
             )
             # Compute previous image: x_t -> x_t-1
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
+
+            # Inpainting: anchor on the first denoising step only, injecting the guidance
+            # at the next noise level so the model conditions on it for all subsequent steps.
+            if anchor_action is not None and i == 0:
+                n_a = anchor_action.shape[1]
+                t_next = timesteps[i + 1] if i + 1 < len(timesteps) else None
+                if t_next is not None:
+                    t_tensor = torch.full((batch_size,), t_next, dtype=torch.long, device=sample.device)
+                    noisy = self.noise_scheduler.add_noise(
+                        anchor_action, torch.randn_like(anchor_action), t_tensor
+                    )
+                    sample[:, act_start : act_start + n_a, :] = noisy
 
         return sample
 
@@ -300,7 +315,11 @@ class DiffusionModel(nn.Module):
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
     def generate_actions(
-        self, batch: dict[str, Tensor], noise: Tensor | None = None, sa_noise_ratio: float | None = None
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        sa_noise_ratio: float | None = None,
+        anchor_action: Tensor | None = None,
     ) -> Tensor:
         """
         This function expects `batch` to have:
@@ -320,7 +339,11 @@ class DiffusionModel(nn.Module):
 
         # run sampling
         actions = self.conditional_sample(
-            batch_size, global_cond=global_cond, noise=noise, sa_noise_ratio=sa_noise_ratio
+            batch_size,
+            global_cond=global_cond,
+            noise=noise,
+            sa_noise_ratio=sa_noise_ratio,
+            anchor_action=anchor_action,
         )
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
