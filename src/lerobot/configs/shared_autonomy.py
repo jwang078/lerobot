@@ -53,6 +53,7 @@ class SharedAutonomyConfig:
     robot_name: str = "robot_iphone_w_engine_new"
     max_joint_delta: float = 0.016
     num_dofs: int = 6
+    blend_mode: str = "every_step"  # "every_step" or "once_per_chunk"
     debug: bool = False
     debug_maxlen: int = 100
 
@@ -65,3 +66,6 @@ class SharedAutonomyConfig:
             )
         if self.debug_maxlen <= 0:
             raise ValueError(f"debug_maxlen must be positive, got {self.debug_maxlen}")
+        valid_blend_modes = {"every_step", "once_per_chunk"}
+        if self.blend_mode not in valid_blend_modes:
+            raise ValueError(f"blend_mode must be one of {valid_blend_modes}, got '{self.blend_mode}'")

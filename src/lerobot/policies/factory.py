@@ -708,6 +708,7 @@ def _wrap_with_shared_autonomy(policy, cfg):
         robot_name=sa_cfg.robot_name,
         max_joint_delta=sa_cfg.max_joint_delta,
         num_dofs=sa_cfg.num_dofs,
+        blend_mode=sa_cfg.blend_mode,
     )
 
     # Connect shared context for teleop recording (if active)
