@@ -72,6 +72,7 @@ def euler_integrate(
     execution_horizon: int | None = None,
     t_start: float = 1.0,
     dt: float | None = None,
+    post_step: "Callable[[int, float, Tensor], Tensor] | None" = None,
 ) -> Tensor:
     """Forward-Euler integration of a velocity field from t=1 (noise) to t=0 (actions).
 
@@ -101,6 +102,10 @@ def euler_integrate(
             1 walks the SAME timestep grid the model was trained on and simply
             takes fewer steps — rather than stretching dt to fit num_steps.
             With the defaults this is exactly ``num_steps`` steps from t=1.
+        post_step: Optional ``(step, time, x_t) -> x_t`` hook applied after each
+            Euler update. Used for inpainting/anchoring, where some action
+            positions are re-pinned to a guidance signal at the next noise level
+            so the model conditions on them for the remaining steps.
     """
     bsize = noise.shape[0]
     device = noise.device
@@ -129,6 +134,9 @@ def euler_integrate(
             v_t = denoise_step_partial_call(x_t)
 
         x_t = x_t + dt * v_t
+
+        if post_step is not None:
+            x_t = post_step(step, time, x_t)
 
         if rtc_processor is not None and rtc_processor.is_debug_enabled():
             rtc_processor.track(time=time, x_t=x_t, v_t=v_t)

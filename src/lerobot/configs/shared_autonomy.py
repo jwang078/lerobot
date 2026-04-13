@@ -54,6 +54,11 @@ class SharedAutonomyConfig:
     max_joint_delta: float = 0.016
     num_dofs: int = 6
     blend_mode: str = "every_step"  # "every_step" or "once_per_chunk"
+    # Number of action steps at the start of each chunk to anchor exactly to guidance via inpainting.
+    # 0 = current behavior (full-chunk blending only). k > 0 = clamp first k steps to guidance
+    # inside the denoising loop, letting the model generate a coherent continuation from those steps.
+    # Only applies to GuidanceBlendStrategy.DENOISE.
+    n_anchor_steps: int = 0
     debug: bool = False
     debug_maxlen: int = 100
 

@@ -663,6 +663,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # already carries a partial forward flow (see euler_integrate(t_start=...)).
         t_start = 1.0
         # Initialize denoising parameters
+        anchor_action: Tensor | None = kwargs.get("anchor_action")
+        # Sample anchor noise ONCE outside the ODE loop so all steps stay on the same
+        # flow trajectory (re-sampling per step would cause chaotic velocity fields).
+        anchor_noise = torch.randn_like(anchor_action) if anchor_action is not None else None
         sa_noise_ratio = kwargs.get("sa_noise_ratio")
         if sa_noise_ratio is not None and noise is not None:
             # Shared autonomy: noise already contains partially-noised human action,
@@ -701,6 +705,38 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             execution_horizon=kwargs.get("execution_horizon"),
             t_start=t_start,
             dt=dt,
+        )
+        def _anchor_post_step(step, time, x_t):
+            # Inpainting: re-anchor the first n_anchor_steps action positions to
+            # guidance at the NEXT noise level, so the model conditions on them
+            # for the remaining steps. Fixed anchor_noise keeps one ODE trajectory.
+            if anchor_action is None or anchor_noise is None or step >= num_steps // 2:
+                return x_t
+            n_a = anchor_action.shape[1]
+            t_next = time + dt
+            if t_next > 0:
+                x_t[:, :n_a, : anchor_action.shape[2]] = (
+                    t_next * anchor_noise + (1.0 - t_next) * anchor_action
+                )
+            return x_t
+
+        return euler_integrate(
+            lambda input_x_t, current_timestep: self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=input_x_t,
+                timestep=current_timestep,
+            ),
+            noise,
+            num_steps,
+            rtc_processor=self.rtc_processor,
+            rtc_enabled=self._rtc_enabled(),
+            inference_delay=kwargs.get("inference_delay"),
+            prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
+            execution_horizon=kwargs.get("execution_horizon"),
+            t_start=t_start,
+            dt=dt,
+            post_step=_anchor_post_step if anchor_action is not None else None,
         )
 
     def denoise_step(
