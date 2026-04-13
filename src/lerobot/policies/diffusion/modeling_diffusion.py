@@ -228,10 +228,13 @@ class DiffusionModel(nn.Module):
         timesteps = self.noise_scheduler.timesteps
 
         # Shared autonomy: start denoising from intermediate timestep.
-        # noise already contains partially-noised human action via scheduler.add_noise
+        # noise already contains partially-noised human action via scheduler.add_noise.
+        # Index into the discrete inference timesteps so the first denoising step
+        # matches the exact noise level injected by _build_guidance_noise_from_chunk.
         if sa_noise_ratio is not None:
-            t_sw = int(sa_noise_ratio * self.noise_scheduler.config.num_train_timesteps)
-            timesteps = timesteps[timesteps <= t_sw]
+            start_step_idx = int((1.0 - sa_noise_ratio) * len(timesteps))
+            start_step_idx = max(0, min(start_step_idx, len(timesteps) - 1))
+            timesteps = timesteps[start_step_idx:]
 
         for t in timesteps:
             # Predict model output.
