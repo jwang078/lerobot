@@ -126,10 +126,26 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
     if "camera_obs" in observations:
         return_observations[f"{OBS_STR}.camera_obs"] = observations["camera_obs"]
 
+    # Pass through policy_guidance_chunk for shared autonomy.
+    # Convert to tensor; skip if all-NaN (placeholder for "no guidance active").
+    if "policy_guidance_chunk" in observations:
+        pgc = torch.from_numpy(np.array(observations["policy_guidance_chunk"], dtype=np.float32)).float()
+        if not torch.isnan(pgc).all():
+            if pgc.dim() == 2:  # [N, action_dim] → [1, N, action_dim]
+                pgc = pgc.unsqueeze(0)
+            return_observations[f"{OBS_STR}.policy_guidance_chunk"] = pgc
+
     # Pass through any remaining ndarray/tensor keys not already handled above,
-    # so env plugins can expose extra observation keys (e.g. policy_guidance_action
-    # for shared autonomy) via get_env_processors().
-    _handled = {"pixels", "environment_state", "agent_pos", "robot_state", "policy", "camera_obs"}
+    # so env plugins can expose extra observation keys via get_env_processors().
+    _handled = {
+        "pixels",
+        "environment_state",
+        "agent_pos",
+        "robot_state",
+        "policy",
+        "camera_obs",
+        "policy_guidance_chunk",
+    }
     for key, value in observations.items():
         if key in _handled:
             continue
