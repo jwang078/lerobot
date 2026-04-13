@@ -826,6 +826,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         # Initialize denoising parameters
+        anchor_action: Tensor | None = kwargs.get("anchor_action")
+        # Sample anchor noise ONCE outside the ODE loop so all steps stay on the same
+        # flow trajectory (re-sampling per step would cause chaotic velocity fields).
+        anchor_noise = torch.randn_like(anchor_action) if anchor_action is not None else None
         sa_noise_ratio = kwargs.get("sa_noise_ratio")
         if sa_noise_ratio is not None and noise is not None:
             # Shared autonomy: noise already contains partially-noised human action,
@@ -891,6 +895,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
+
+            # Inpainting: re-anchor first n_anchor_steps action positions to guidance.
+            # Uses the fixed anchor_noise sampled before the loop to stay on one ODE trajectory.
+            # Anchor on the first ODE step only, injecting guidance at the next noise level
+            # so the model conditions on it for all subsequent steps.
+            if anchor_action is not None and anchor_noise is not None and step < num_steps // 2:  # step == 0:
+                n_a = anchor_action.shape[1]
+                t_next = time + dt
+                if t_next > 0:
+                    x_t[:, :n_a, : anchor_action.shape[2]] = (
+                        t_next * anchor_noise + (1.0 - t_next) * anchor_action
+                    )
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
