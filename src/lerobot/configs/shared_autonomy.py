@@ -61,6 +61,10 @@ class SharedAutonomyConfig:
     n_anchor_steps: int = 0
     debug: bool = False
     debug_maxlen: int = 100
+    # Control rate (Hz) used by the RRT-to-Goal mode for ruckig time parametrization.
+    # Should match the env's fps. Only consulted when the GUI's "RRT to Goal" button
+    # is pressed, so a slightly off value just changes the trajectory pacing.
+    fps: int = 30
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.forward_flow_ratio <= 1.0:
