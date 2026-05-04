@@ -548,6 +548,11 @@ class SplatSimEnv(EnvConfig):
     external_port: int | None = None
     external_host: str = "127.0.0.1"
 
+    # When True, the gym env exposes get_env_config() so the policy / wrapper can
+    # access obstacle geometry and the task goal (q_goal_bias, target_ee_pos/quat).
+    # Required for the shared autonomy wrapper's "RRT to Goal" mode.
+    include_oracle_info: bool = False
+
     # Teleop recording: save pure-teleop (ratio=0) segments to a LeRobot dataset.
     # Set to a repo ID (e.g. "user/teleop-data") to enable; None to disable.
     teleop_dataset_repo_id: str | None = None
@@ -596,13 +601,26 @@ class SplatSimEnv(EnvConfig):
 
     @property
     def gym_kwargs(self) -> dict:
+        # When teleop recording is configured, force the SplatSim server to
+        # render every ImageResizeMode regardless of what the policy itself
+        # uses. This way the saved dataset always has every variant
+        # ({cam}_letterbox, {cam}_stretch, ...) available for downstream
+        # training of policies that may want a different resize mode. The
+        # policy's preprocessor (rename_map) still picks whichever one it
+        # was trained on.
+        server_image_resize_modes = self.image_resize_modes
+        if self.teleop_dataset_repo_id is not None:
+            from splatsim.configs.mode_config import ImageResizeMode
+
+            server_image_resize_modes = [m.value for m in ImageResizeMode]
+
         cfg = {
             "robot_name": self.robot_name,
             "camera_names": self.camera_names,
             "cam_i": self.cam_i,
             "use_gripper": self.use_gripper,
             "debug_mode": self.debug_mode,
-            "image_resize_modes": self.image_resize_modes,
+            "image_resize_modes": server_image_resize_modes,
             "port": self.port,
         }
         # Include task_description if provided (for language-conditioned policies)
@@ -622,38 +640,57 @@ class SplatSimEnv(EnvConfig):
         env_cls = gym.vector.AsyncVectorEnv if (use_async_envs and n_envs > 1) else gym.vector.SyncVectorEnv
         splatsim_render_mode = self.gym_kwargs.get("render_mode", "rgb_array")
 
+        # ---- Teleop recording (shared by ZMQ + local-spawn branches) ---- #
+        teleop_context = None
+        teleop_dataset = None
+        image_keys = None
+        if self.teleop_dataset_repo_id is not None:
+            from splatsim.configs.mode_config import ImageResizeMode
+            from splatsim.utils.lerobot_utils import create_lerobot_dataset, load_lerobot_dataset
+
+            from lerobot.policies.teleop_recording import TeleopRecordingContext
+
+            teleop_context = TeleopRecordingContext.get_instance()
+            image_keys = [f"{cam}_{mode.value}" for cam in self.camera_names for mode in ImageResizeMode]
+            teleop_dataset = load_lerobot_dataset(self.teleop_dataset_repo_id)
+            if teleop_dataset is None:
+                teleop_dataset = create_lerobot_dataset(
+                    self.teleop_dataset_repo_id, fps=self.fps, image_keys=image_keys
+                )
+
+        # Locals captured into _make_splatsim closures below.
+        task = self.task
+        episode_length = self.episode_length
+        teleop_min_episode_length = self.teleop_min_episode_length
+
+        def _wrap_for_recording(env):
+            """Apply TeleopRecordingWrapper when teleop recording is configured."""
+            if teleop_context is not None and teleop_dataset is not None:
+                from lerobot.policies.teleop_recording import TeleopRecordingWrapper
+
+                # image_keys is populated in the same block as teleop_dataset
+                # above; assert for the type checker's benefit.
+                assert image_keys is not None
+                env = TeleopRecordingWrapper(
+                    env,
+                    context=teleop_context,
+                    dataset=teleop_dataset,
+                    image_keys=image_keys,
+                    task=task,
+                    min_episode_length=teleop_min_episode_length,
+                )
+            return env
+
         if self.external_port is not None:
             from splatsim.gym_env import ZMQSplatSimGymEnv
 
-            # Set up teleop recording if configured
-            teleop_context = None
-            teleop_dataset = None
-            image_keys = None
-            if self.teleop_dataset_repo_id is not None:
-                from splatsim.configs.mode_config import ImageResizeMode
-                from splatsim.utils.lerobot_utils import create_lerobot_dataset, load_lerobot_dataset
-
-                from lerobot.policies.teleop_recording import TeleopRecordingContext
-
-                teleop_context = TeleopRecordingContext.get_instance()
-                image_keys = [
-                    f"{cam}_{mode.value}" for cam in self.camera_names for mode in ImageResizeMode
-                ]
-                teleop_dataset = load_lerobot_dataset(self.teleop_dataset_repo_id)
-                if teleop_dataset is None:
-                    teleop_dataset = create_lerobot_dataset(
-                        self.teleop_dataset_repo_id, fps=self.fps, image_keys=image_keys
-                    )
-
             external_host = self.external_host
             external_port = self.external_port
+            include_oracle_info = self.include_oracle_info
             camera_names = self.camera_names
             image_resize_modes = self.image_resize_modes
             observation_height = self.observation_height
             observation_width = self.observation_width
-            episode_length = self.episode_length
-            task = self.task
-            teleop_min_episode_length = self.teleop_min_episode_length
 
             def _make_splatsim():
                 env = ZMQSplatSimGymEnv(
@@ -666,25 +703,14 @@ class SplatSimEnv(EnvConfig):
                     image_width=observation_width,
                     render_mode=splatsim_render_mode,
                     max_episode_steps=episode_length,
+                    include_oracle_info=include_oracle_info,
                 )
-                if teleop_context is not None and teleop_dataset is not None:
-                    from lerobot.policies.teleop_recording import TeleopRecordingWrapper
-
-                    env = TeleopRecordingWrapper(
-                        env,
-                        context=teleop_context,
-                        dataset=teleop_dataset,
-                        image_keys=image_keys,
-                        task=task,
-                        min_episode_length=teleop_min_episode_length,
-                    )
-                return env
+                return _wrap_for_recording(env)
         else:
             from splatsim.gym_env import make_single_env
             from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
 
             splatsim_cfg = self.gym_kwargs.get("cfg", {})
-            task = self.task
             splatsim_serve_mode = (
                 PybulletRobotServerBase.SERVE_MODES.EVAL_BENCHMARK
                 if self.eval_benchmark_repo_id is not None
@@ -692,9 +718,20 @@ class SplatSimEnv(EnvConfig):
             )
 
             def _make_splatsim():
-                return make_single_env(
-                    task, cfg=splatsim_cfg, render_mode=splatsim_render_mode, serve_mode=splatsim_serve_mode
+                env = make_single_env(
+                    task,
+                    cfg=splatsim_cfg,
+                    render_mode=splatsim_render_mode,
+                    serve_mode=splatsim_serve_mode,
                 )
+                # Local mode honours the lerobot-side episode_length cap. The
+                # underlying robot server's _max_episode_steps drives both the
+                # gym env's truncation and the rollout loop's max_steps query.
+                if hasattr(env, "robot_server") and env.robot_server is not None:
+                    env.robot_server._max_episode_steps = episode_length
+                if hasattr(env, "_max_episode_steps"):
+                    env._max_episode_steps = episode_length
+                return _wrap_for_recording(env)
 
         try:
             from gymnasium.vector import AutoresetMode

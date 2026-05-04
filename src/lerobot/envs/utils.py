@@ -28,6 +28,7 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from torch import Tensor
 
 from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.types import RobotObservation
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGE, OBS_IMAGES, OBS_STATE, OBS_STR
 from lerobot.utils.utils import get_channel_first_image_shape
 
@@ -116,6 +117,11 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
                 pgc = pgc.unsqueeze(0)
             return_observations[f"{OBS_STR}.policy_guidance_chunk"] = pgc
 
+    # Pass through oracle env config (object/obstacle geometry, task goal) for the
+    # shared autonomy wrapper's RRT-to-Goal mode. Plain Python dict; not tensorised.
+    if "oracle_env_config" in observations:
+        return_observations["oracle_env_config"] = observations["oracle_env_config"]
+
     return return_observations
 
 
@@ -201,6 +207,15 @@ class _LazyAsyncVectorEnv:
         if self._env is not None:
             self._env.close()
             self._env = None
+
+
+def are_all_envs_same_type(env: gym.vector.VectorEnv) -> bool:
+    """Check if all sub-environments are of the same type."""
+    try:
+        types = env.call("__class__")
+        return len({t.__name__ for t in types}) == 1
+    except Exception:
+        return True  # Assume same type if we can't check
 
 
 def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:

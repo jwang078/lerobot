@@ -82,6 +82,7 @@ from lerobot.envs import (
     preprocess_observation,
 )
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.policies.factory import _reconnect_relative_absolute_steps, _wrap_with_shared_autonomy
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.types import PolicyAction
 from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
@@ -183,6 +184,16 @@ def rollout(
         observation = env_preprocessor(observation)
 
         observation = preprocessor(observation)
+
+        # Inject oracle env config AFTER the policy preprocessor, since the pipeline
+        # drops keys that don't match its known observation/complementary schema.
+        # The wrapper consumes this directly (Python dict, not a tensor).
+        try:
+            oracle_cfgs = env.call("get_env_config")
+            if oracle_cfgs is not None and any(c is not None for c in oracle_cfgs):
+                observation["oracle_env_config"] = oracle_cfgs[0]
+        except (AttributeError, NotImplementedError):
+            pass
         amp_device_type = policy.config.device if hasattr(policy.config, "device") else "cuda"
         use_amp = getattr(policy.config, "use_amp", False)
         with (
@@ -654,6 +665,13 @@ def eval_main(cfg: EvalPipelineConfig):
         preprocessor_overrides=preprocessor_overrides,
     )
 
+    sa_cfg = getattr(cfg.policy, "shared_autonomy_config", None)
+    if sa_cfg is not None and sa_cfg.enabled:
+        policy = _wrap_with_shared_autonomy(policy, cfg.policy)
+        _reconnect_relative_absolute_steps(preprocessor, policy.postprocessor, policy=policy)
+    else:
+        _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
+
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
@@ -832,6 +850,7 @@ def eval_policy_all(
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
     output_dir: Path | None = None,
+    close_envs_after_eval: bool = True,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -932,7 +951,8 @@ def eval_policy_all(
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
                 _save_partial_snapshot()
             finally:
-                env.close()
+                if close_envs_after_eval:
+                    env.close()
                 # Prefetch next task's workers *after* closing current env to prevent
                 # GPU memory overlap between consecutive tasks.
                 if i + 1 < len(tasks):
@@ -954,7 +974,8 @@ def eval_policy_all(
                     per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
                     _save_partial_snapshot()
                 finally:
-                    env.close()
+                    if close_envs_after_eval:
+                        env.close()
 
     # compute aggregated metrics helper (robust to lists/scalars)
     def _agg_from_list(xs):

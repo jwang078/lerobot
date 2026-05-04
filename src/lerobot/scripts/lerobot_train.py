@@ -43,11 +43,14 @@ from lerobot.common.train_utils import (
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets import EpisodeAwareSampler, make_dataset
+from lerobot.datasets import make_dataset
+from lerobot.datasets.io_utils import cast_stats_to_numpy
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.policies.factory import _reconnect_relative_absolute_steps, _wrap_with_shared_autonomy
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.io_utils import load_json
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
@@ -196,6 +199,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             cpu=force_cpu,
         )
 
+    assert accelerator is not None
     init_logging(accelerator=accelerator)
 
     # Determine if this is the main process (for logging and checkpointing)
@@ -227,6 +231,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     torch.backends.cuda.matmul.allow_tf32 = True
 
     # Dataset loading synchronization: main process downloads first to avoid race conditions
+    dataset = None
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
@@ -236,6 +241,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+
+    assert dataset is not None
+
+    # Override dataset stats with a custom stats file if specified. This lets multiple
+    # policies (e.g. diffusion with chunk_size=8, pi05 with chunk_size=50) share the same
+    # dataset on disk while each using their own relative-action normalization stats.
+    if cfg.dataset.stats_path is not None:
+        from pathlib import Path
+
+        stats_path = Path(cfg.dataset.stats_path)
+        logging.info(f"Overriding dataset stats from {stats_path}")
+        dataset.meta.stats = cast_stats_to_numpy(load_json(stats_path))
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -322,6 +339,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         **postprocessor_kwargs,
     )
 
+    sa_cfg = getattr(cfg.policy, "shared_autonomy_config", None)
+    if sa_cfg is not None and sa_cfg.enabled:
+        policy = _wrap_with_shared_autonomy(policy, cfg.policy)
+        _reconnect_relative_absolute_steps(preprocessor, policy.postprocessor, policy=policy)
+    else:
+        _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
+
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -375,25 +399,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
-        shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
-        )
-    else:
-        shuffle = True
-        sampler = None
-
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
         batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
-        sampler=sampler,
+        shuffle=not cfg.dataset.streaming,
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
@@ -523,6 +533,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         max_episodes_rendered=4,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        close_envs_after_eval=False,  # training owns env lifetime; closed at end of train()
                     )
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]
