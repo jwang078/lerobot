@@ -36,6 +36,10 @@ class DatasetConfig:
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+    # Optional path to a stats.json file to use instead of the dataset's built-in meta/stats.json.
+    # Useful when training multiple policies (e.g. diffusion vs pi05) with different chunk sizes
+    # for relative action stats, without needing to store the dataset twice.
+    stats_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.episodes is not None:

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import gc
 from typing import TYPE_CHECKING
 
 import torch
@@ -197,8 +198,10 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
 
     def __init__(self, config: GemmaConfig, **kwargs):
         super().__init__(config, **kwargs)
-        # if not getattr(config, "use_adarms", False):
-        #     return
+        # Free the standard Gemma layers/norm allocated by super().__init__() before
+        # replacing them — avoids holding 2× the layer memory simultaneously.
+        del self.layers, self.norm
+        gc.collect()
         cond_dim = getattr(config, "adarms_cond_dim", None)
         pi_gemma_decoder_layer_base = _get_pi_gemma_decoder_layer_base()
         self.layers = nn.ModuleList(
@@ -328,6 +331,8 @@ class PiGemmaForCausalLM(GemmaForCausalLM):  # type: ignore[misc]
 
     def __init__(self, config: GemmaConfig, **kwargs):
         super().__init__(config, **kwargs)
+        del self.model
+        gc.collect()
         self.model = PiGemmaModel(config)
 
 
@@ -336,6 +341,8 @@ class PaliGemmaModelWithPiGemma(PaliGemmaModel):
 
     def __init__(self, config):
         super().__init__(config)
+        del self.language_model
+        gc.collect()
         self.language_model = PiGemmaModel(config.text_config)
 
 
@@ -344,6 +351,8 @@ class PaliGemmaForConditionalGenerationWithPiGemma(PaliGemmaForConditionalGenera
 
     def __init__(self, config):
         super().__init__(config)
+        del self.model
+        gc.collect()
         self.model = PaliGemmaModelWithPiGemma(config)
 
     # Make modules available through conditional class for BC

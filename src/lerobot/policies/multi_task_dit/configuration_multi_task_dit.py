@@ -101,14 +101,8 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 0
     do_mask_loss_for_padding: bool = False
 
-    # Auto-calculated
-    drop_n_last_frames: int | None = None
-
     def __post_init__(self):
         super().__post_init__()
-
-        if self.drop_n_last_frames is None:
-            self.drop_n_last_frames = self.horizon - self.n_action_steps - self.n_obs_steps + 1
 
         self._validate()
 

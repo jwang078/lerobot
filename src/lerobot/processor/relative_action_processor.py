@@ -21,7 +21,7 @@ from torch import Tensor
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.types import EnvTransition, TransitionKey
-from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
 from .pipeline import ProcessorStep, ProcessorStepRegistry
@@ -102,6 +102,44 @@ class RelativeActionsProcessorStep(ProcessorStep):
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
+    # Optional reference to the policy running inference. Used to detect chunk
+    # boundaries (via the policy's action queue) so the cached anchor state is
+    # only refreshed when a fresh chunk is about to be predicted. Not serialized.
+    _policy: Any = field(default=None, init=False, repr=False)
+
+    def attach_policy(self, policy: Any) -> None:
+        """Attach the policy running inference so anchor caching can be gated on
+        chunk boundaries. Safe to call multiple times; pass None to detach.
+        """
+        self._policy = policy
+
+    def _policy_queue_empty(self) -> bool:
+        """Return True if the attached policy has no buffered chunk actions,
+        meaning a fresh chunk is about to be predicted on the next select_action.
+
+        When no policy is attached (e.g. training, unit tests, one-off calls),
+        returns True so the cache is always refreshed — backward-compatible.
+
+        Supports both common queue conventions used across policy modules:
+        - ``self._action_queue`` (deque): act, pi0, pi05, pi0_fast, groot
+        - ``self._queues[ACTION]`` (deque): diffusion, smolvla, vqbet,
+          wall_x, xvla, multi_task_dit, tdmpc
+        Unwraps wrappers exposing ``inner_policy`` (e.g. SharedAutonomyPolicyWrapper).
+        """
+        policy = self._policy
+        if policy is None:
+            return True
+        while hasattr(policy, "inner_policy"):
+            policy = policy.inner_policy
+        action_queue = getattr(policy, "_action_queue", None)
+        if action_queue is not None:
+            return len(action_queue) == 0
+        queues_dict = getattr(policy, "_queues", None)
+        if queues_dict is not None:
+            action_q = queues_dict.get(ACTION) if hasattr(queues_dict, "get") else None
+            if action_q is not None:
+                return len(action_q) == 0
+        return True
 
     def _build_mask(self, action_dim: int) -> list[bool]:
         if not self.exclude_joints or self.action_names is None:
@@ -125,9 +163,16 @@ class RelativeActionsProcessorStep(ProcessorStep):
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         observation = transition.get(TransitionKey.OBSERVATION, {})
         state = observation.get(OBS_STATE) if observation else None
+        has_action = transition.get(TransitionKey.ACTION) is not None
 
-        # Always cache state for the paired AbsoluteActionsProcessorStep
-        if state is not None:
+        # Cache the anchor state for the paired AbsoluteActionsProcessorStep.
+        # During training the transition carries an action and we always refresh
+        # (harmless — postprocessor isn't called in that path). During chunked
+        # inference the action is None; only refresh when the policy's action
+        # queue is empty, i.e. a fresh chunk is about to be predicted. Otherwise
+        # mid-chunk preprocessor calls would overwrite the anchor with stale
+        # per-step state, producing wrong absolute actions for chunk[1..n-1].
+        if state is not None and (has_action or self._policy_queue_empty()):
             self._last_state = state
 
         if not self.enabled:
@@ -137,6 +182,12 @@ class RelativeActionsProcessorStep(ProcessorStep):
         action = new_transition.get(TransitionKey.ACTION)
         if action is None or state is None:
             return new_transition
+
+        # During training the dataset provides state as (B, n_obs_steps, state_dim).
+        # to_relative_actions expects (B, state_dim); use the most recent timestep as the base,
+        # consistent with UMI/OpenPI which anchor all actions relative to the current state.
+        if state.ndim == 3:
+            state = state[:, -1, :]
 
         mask = self._build_mask(action.shape[-1])
         new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)

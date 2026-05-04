@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, TypedDict, Unpack
+from typing import TYPE_CHECKING, Any, TypedDict, Unpack, cast
 
 import torch
 
@@ -63,7 +63,9 @@ from .xvla.configuration_xvla import XVLAConfig
 
 
 def _reconnect_relative_absolute_steps(
-    preprocessor: PolicyProcessorPipeline, postprocessor: PolicyProcessorPipeline
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+    policy: Any | None = None,
 ) -> None:
     """Wire AbsoluteActionsProcessorStep.relative_step to the RelativeActionsProcessorStep after deserialization.
 
@@ -71,13 +73,21 @@ def _reconnect_relative_absolute_steps(
     independently from their configs. AbsoluteActionsProcessorStep needs a live reference to
     the RelativeActionsProcessorStep so it can read the cached state at inference time.
     That reference is not serializable, so we re-establish it here after loading.
+
+    If ``policy`` is provided, also attaches it to the RelativeActionsProcessorStep so that
+    the anchor state is only refreshed on chunk boundaries during chunked inference (i.e.
+    when the policy's action queue is empty). Without this, the anchor would drift to the
+    per-step state mid-chunk and reconstruct wrong absolute actions for chunk[1..n-1].
     """
     relative_step = next((s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep)), None)
     if relative_step is None:
         return
+    relative_step = cast(RelativeActionsProcessorStep, relative_step)
     for step in postprocessor.steps:
         if isinstance(step, AbsoluteActionsProcessorStep) and step.relative_step is None:
             step.relative_step = relative_step
+    if policy is not None:
+        relative_step.attach_policy(policy)
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -582,11 +592,6 @@ def make_policy(
         validate_visual_features_consistency(cfg, features)
         # TODO: (jadechoghari) - add a check_state(cfg, features) and check_action(cfg, features)
 
-    # Wrap with shared autonomy if enabled
-    sa_cfg = getattr(cfg, "shared_autonomy_config", None)
-    if sa_cfg is not None and sa_cfg.enabled:
-        policy = _wrap_with_shared_autonomy(policy, cfg)
-
     return policy
 
 
@@ -710,6 +715,7 @@ def _wrap_with_shared_autonomy(policy, cfg):
         num_dofs=sa_cfg.num_dofs,
         blend_mode=sa_cfg.blend_mode,
         n_anchor_steps=sa_cfg.n_anchor_steps,
+        fps=sa_cfg.fps,
     )
 
     # Connect shared context for teleop recording (if active)

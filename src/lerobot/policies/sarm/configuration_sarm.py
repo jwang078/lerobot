@@ -64,7 +64,6 @@ class SARMConfig(PreTrainedConfig):
     num_heads: int = 12
     num_layers: int = 8
     max_state_dim: int = 32
-    drop_n_last_frames: int = 1
     batch_size: int = 64
     clip_batch_size: int = 64
     dropout: float = 0.1

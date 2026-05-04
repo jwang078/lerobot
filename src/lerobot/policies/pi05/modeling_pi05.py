@@ -16,6 +16,7 @@
 
 import builtins
 import copy
+import gc
 import logging
 import math
 from collections import deque
@@ -438,11 +439,12 @@ class PaliGemmaWithExpertModel(
 
     def embed_image(self, image: torch.Tensor):
         # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32).
+        # get_image_features returns projected features (Tensor) in newer transformers.
         out_dtype = image.dtype
         if image.dtype != torch.float32:
             image = image.to(torch.float32)
-        image_outputs = self.paligemma.model.get_image_features(image)
-        features = image_outputs.pooler_output * self.paligemma.config.text_config.hidden_size**0.5
+        image_features = self.paligemma.model.get_image_features(image)
+        features = image_features.pooler_output * self.paligemma.config.text_config.hidden_size**0.5
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
@@ -862,16 +864,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = noise
 
         # actual_num_steps = int(torch.ceil(torch.tensor((t_start - 0.0) / (-dt))).item())
-        print(
-            # "action num steps:",
-            # actual_num_steps,
-            "sa_noise_ratio:",
-            sa_noise_ratio,
-            "t_start:",
-            t_start,
-            "dt:",
-            dt,
-        )
         # for step in range(actual_num_steps):
         for step in range(num_steps):
             time = t_start + step * dt
@@ -990,6 +982,11 @@ class PI05Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
+        # PiGemmaModel and PaliGemmaModelWithPiGemma call super().__init__() which
+        # instantiates full standard Gemma models, then immediately replaces them with Pi
+        # variants. Force GC here so those discarded allocations are freed from CPU RAM
+        # before the model is moved to GPU, preventing swap pressure.
+        gc.collect()
         self.model.to(config.device)
 
         self.reset()
