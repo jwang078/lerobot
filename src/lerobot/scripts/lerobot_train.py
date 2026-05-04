@@ -69,15 +69,21 @@ from lerobot.distributed import (
     make_accelerator,
     set_fsdp_wrap_modules,
 )
+from lerobot.datasets.io_utils import cast_stats_to_numpy
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
-from lerobot.policies.factory import ProcessorConfigKwargs
+from lerobot.policies.factory import (
+    ProcessorConfigKwargs,
+    _reconnect_relative_absolute_steps,
+    _wrap_with_shared_autonomy,
+)
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
 from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
+from lerobot.utils.io_utils import load_json
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
@@ -431,6 +437,18 @@ def train(cfg: TrainPipelineConfig):
     if not is_main_process():
         dataset, eval_dataset = make_train_eval_datasets(cfg)
 
+    assert dataset is not None
+
+    # Override dataset stats with a custom stats file if specified. This lets multiple
+    # policies (e.g. diffusion with chunk_size=8, pi05 with chunk_size=50) share the same
+    # dataset on disk while each using their own relative-action normalization stats.
+    if cfg.dataset.stats_path is not None:
+        from pathlib import Path
+
+        stats_path = Path(cfg.dataset.stats_path)
+        logging.info(f"Overriding dataset stats from {stats_path}")
+        dataset.meta.stats = cast_stats_to_numpy(load_json(stats_path))
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -547,6 +565,13 @@ def train(cfg: TrainPipelineConfig):
             pretrained_revision=getattr(cfg.policy, "pretrained_revision", None),
             **processor_kwargs,
         )
+
+    sa_cfg = getattr(cfg.policy, "shared_autonomy_config", None)
+    if sa_cfg is not None and sa_cfg.enabled:
+        policy = _wrap_with_shared_autonomy(policy, cfg.policy)
+        _reconnect_relative_absolute_steps(preprocessor, policy.postprocessor, policy=policy)
+    else:
+        _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
 
     # Created BEFORE prepare on the unsharded parameters — accelerate's FSDP2 path requires the
     # model and optimizer in one prepare() call and rebinds the param groups itself.
@@ -874,6 +899,7 @@ def train(cfg: TrainPipelineConfig):
                         max_episodes_rendered=4,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        close_envs_after_eval=False,  # training owns env lifetime; closed at end of train()
                     )
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]

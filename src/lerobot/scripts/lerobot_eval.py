@@ -85,6 +85,7 @@ from lerobot.envs import (
 from lerobot.envs.utils import NEW_ROLLOUT_OPTION
 from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.policies.factory import _reconnect_relative_absolute_steps, _wrap_with_shared_autonomy
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
@@ -290,6 +291,18 @@ def rollout(
             observation = env_preprocessor(observation)
 
             observation = preprocessor(observation)
+
+            # Inject oracle env config AFTER the policy preprocessor, since the
+            # pipeline drops keys that don't match its known observation /
+            # complementary schema. Consumed directly by the shared-autonomy
+            # wrapper (Python dict, not a tensor).
+            try:
+                oracle_cfgs = env.call("get_env_config")
+                if oracle_cfgs is not None and any(c is not None for c in oracle_cfgs):
+                    observation["oracle_env_config"] = oracle_cfgs[0]
+            except (AttributeError, NotImplementedError):
+                pass
+
             with torch.inference_mode():
                 action = policy.select_action(observation)
             if predicted_latents_callback is not None:
@@ -867,6 +880,13 @@ def eval_main(cfg: EvalPipelineConfig):
         preprocessor_overrides=preprocessor_overrides,
     )
 
+    sa_cfg = getattr(cfg.policy, "shared_autonomy_config", None)
+    if sa_cfg is not None and sa_cfg.enabled:
+        policy = _wrap_with_shared_autonomy(policy, cfg.policy)
+        _reconnect_relative_absolute_steps(preprocessor, policy.postprocessor, policy=policy)
+    else:
+        _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
+
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
@@ -1086,6 +1106,7 @@ def eval_policy_all(
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
     output_dir: Path | None = None,
+    close_envs_after_eval: bool = True,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -1196,7 +1217,8 @@ def eval_policy_all(
                     per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
                     _save_partial_snapshot()
                 finally:
-                    env.close()
+                    if close_envs_after_eval:
+                        env.close()
                     # Prefetch next task's workers *after* closing current env to prevent
                     # GPU memory overlap between consecutive tasks.
                     if i + 1 < len(tasks):
@@ -1217,7 +1239,8 @@ def eval_policy_all(
                         _accumulate_to(tg, metrics)
                         per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
                     finally:
-                        env.close()
+                        if close_envs_after_eval:
+                            env.close()
     finally:
         policy.train(was_training)
 
