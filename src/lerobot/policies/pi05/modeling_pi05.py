@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import builtins
+import copy
+import gc
 import logging
 from collections import deque
 from pathlib import Path
@@ -284,6 +286,7 @@ class PaliGemmaWithExpertModel(
 
     def embed_image(self, image: torch.Tensor):
         # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32).
+        # get_image_features returns projected features (Tensor) in newer transformers.
         out_dtype = image.dtype
         if image.dtype != torch.float32:
             image = image.to(torch.float32)
@@ -689,23 +692,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         else:
             dt = -1.0 / num_steps
 
-        return euler_integrate(
-            lambda input_x_t, current_timestep: self.denoise_step(
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_key_values,
-                x_t=input_x_t,
-                timestep=current_timestep,
-            ),
-            noise,
-            num_steps,
-            rtc_processor=self.rtc_processor,
-            rtc_enabled=self._rtc_enabled(),
-            inference_delay=kwargs.get("inference_delay"),
-            prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
-            execution_horizon=kwargs.get("execution_horizon"),
-            t_start=t_start,
-            dt=dt,
-        )
         def _anchor_post_step(step, time, x_t):
             # Inpainting: re-anchor the first n_anchor_steps action positions to
             # guidance at the NEXT noise level, so the model conditions on them
@@ -813,6 +799,11 @@ class PI05Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
+        # PiGemmaModel and PaliGemmaModelWithPiGemma call super().__init__() which
+        # instantiates full standard Gemma models, then immediately replaces them with Pi
+        # variants. Force GC here so those discarded allocations are freed from CPU RAM
+        # before the model is moved to GPU, preventing swap pressure.
+        gc.collect()
         self.model.to(config.device)
 
         self.reset()

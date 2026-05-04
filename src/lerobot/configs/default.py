@@ -54,6 +54,10 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    # Optional path to a stats.json file to use instead of the dataset's built-in meta/stats.json.
+    # Useful when training multiple policies (e.g. diffusion vs pi05) with different chunk sizes
+    # for relative action stats, without needing to store the dataset twice.
+    stats_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.repo_type not in ("dataset", "bucket"):
