@@ -553,6 +553,12 @@ class SplatSimEnv(EnvConfig):
     # Required for the shared autonomy wrapper's "RRT to Goal" mode.
     include_oracle_info: bool = False
 
+    # When True (default), the wrist camera renders with the GoPro fisheye
+    # calibration. When False, it renders as pinhole using base camera intrinsics.
+    # Use False to A/B test the fisheye visual covariate shift or to reproduce
+    # pre-fisheye datasets.
+    use_fisheye_wrist_camera: bool = True
+
     # Teleop recording: save pure-teleop (ratio=0) segments to a LeRobot dataset.
     # Set to a repo ID (e.g. "user/teleop-data") to enable; None to disable.
     teleop_dataset_repo_id: str | None = None
@@ -622,6 +628,7 @@ class SplatSimEnv(EnvConfig):
             "debug_mode": self.debug_mode,
             "image_resize_modes": server_image_resize_modes,
             "port": self.port,
+            "use_fisheye_wrist_camera": self.use_fisheye_wrist_camera,
         }
         # Include task_description if provided (for language-conditioned policies)
         if self.task_description is not None:
@@ -637,7 +644,13 @@ class SplatSimEnv(EnvConfig):
         }
 
     def create_envs(self, n_envs: int, use_async_envs: bool = False) -> dict:
-        env_cls = gym.vector.AsyncVectorEnv if (use_async_envs and n_envs > 1) else gym.vector.SyncVectorEnv
+        # Honour use_async_envs even at n_envs=1: callers that wrap a single
+        # env around a process-isolated splatsim (e.g. dataset-augmentation
+        # scripts that already hold a pybullet GUI client in the parent
+        # process for the SharedAutonomyPolicyWrapper) need the env to live
+        # in a worker process so its own pybullet GUI client doesn't collide
+        # with the parent's.
+        env_cls = gym.vector.AsyncVectorEnv if use_async_envs else gym.vector.SyncVectorEnv
         splatsim_render_mode = self.gym_kwargs.get("render_mode", "rgb_array")
 
         # ---- Teleop recording (shared by ZMQ + local-spawn branches) ---- #
@@ -733,6 +746,14 @@ class SplatSimEnv(EnvConfig):
                     env._max_episode_steps = episode_length
                 return _wrap_for_recording(env)
 
+        # When the caller asks for AsyncVectorEnv, use the "forkserver" start
+        # method to match how the base EnvConfig.create_envs spawns workers —
+        # avoids fork-after-CUDA hazards if the parent has loaded a policy on
+        # GPU (forkserver forks early before CUDA / threads come up).
+        extra_kwargs: dict = {}
+        if env_cls is gym.vector.AsyncVectorEnv:
+            extra_kwargs["context"] = "forkserver"
+
         try:
             from gymnasium.vector import AutoresetMode
 
@@ -742,9 +763,10 @@ class SplatSimEnv(EnvConfig):
                 # to read is_success). The actual auto-reset fires on the *next* step call, which
                 # never happens since the rollout loop exits on done=True.
                 autoreset_mode=AutoresetMode.NEXT_STEP,
+                **extra_kwargs,
             )
         except ImportError:
-            vec = env_cls([_make_splatsim for _ in range(n_envs)])
+            vec = env_cls([_make_splatsim for _ in range(n_envs)], **extra_kwargs)
         return {"splatsim": {0: vec}}
 
 
