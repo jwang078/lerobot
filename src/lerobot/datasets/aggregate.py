@@ -669,16 +669,24 @@ def aggregate_metadata(
     Returns:
         dict: Updated meta_idx with current chunk and file indices.
     """
-    chunk_file_ids: list[ChunkFile] = sorted(
-        {
-            (c, f)
-            for c, f in zip(
-                src_meta.episodes["meta/episodes/chunk_index"],
-                src_meta.episodes["meta/episodes/file_index"],
-                strict=False,
-            )
-        }
-    )
+    # Derive which source episode parquet files to read by scanning the
+    # filesystem rather than trusting the meta/episodes/file_index column.
+    # That column can be stale when the source dataset was itself created by
+    # a merge: all episodes end up in file-000.parquet but the column still
+    # carries the original source file indices (e.g. [0, 1, 2, 3]).
+    src_episodes_dir = src_meta.root / "meta" / "episodes"
+    chunk_file_ids = set()
+    for parquet_path in sorted(src_episodes_dir.rglob("*.parquet")):
+        rel = parquet_path.relative_to(src_episodes_dir)
+        parts = rel.parts
+        try:
+            chunk_idx_found = int(parts[0].replace("chunk-", ""))
+            file_idx_found = int(parts[1].replace("file-", "").replace(".parquet", ""))
+            chunk_file_ids.add((chunk_idx_found, file_idx_found))
+        except (ValueError, IndexError):
+            continue
+
+    chunk_file_ids = sorted(chunk_file_ids)
     for chunk_idx, file_idx in chunk_file_ids:
         src_path = src_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
         df = pd.read_parquet(src_path)
