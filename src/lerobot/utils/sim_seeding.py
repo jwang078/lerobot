@@ -2,22 +2,24 @@
 
 The lerobot env factory only exposes a Gym vector env API (`reset`, `step`). For the
 visualize / data-relabelling use case we need to start a rollout from an arbitrary
-``(episode_index, frame_index)`` state — Splatsim only natively supports resetting
-to *episode start* via EVAL_BENCHMARK mode.
+``(episode_index, frame_index)`` state.
 
-``seed_splatsim_env_to_state`` bridges that gap: it calls ``reset()`` so the env
-loads the EVAL_BENCHMARK scenario (object poses + episode-start joints), then
-reaches into the underlying ``PybulletRobotServerBase`` to teleport the robot to
-the requested joint state. Object poses still match episode-start — fine for
-tasks where objects are static until the robot makes contact.
+``seed_splatsim_env_to_state`` bridges that gap: it calls ``reset(seed=...)`` so the
+env loads the right benchmark scenario, then — for local (in-process pybullet) envs —
+reaches into the underlying ``PybulletRobotServerBase`` to teleport the robot to the
+requested joint state. For ZMQ (out-of-process) envs the teleport is skipped; the
+robot starts at the episode's initial pose as loaded by the server.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import gymnasium as gym
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def _add_batch_dim(value: Any) -> Any:
@@ -32,60 +34,53 @@ def _add_batch_dim(value: Any) -> Any:
 def seed_splatsim_env_to_state(
     vec_env: gym.vector.VectorEnv,
     *,
-    joint_state: np.ndarray,
+    joint_state: np.ndarray | None = None,
     num_dofs: int = 6,
+    seed: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Reset ``vec_env`` (loading the configured EVAL_BENCHMARK scenario) and teleport
-    the robot to ``joint_state``. Returns a batched gym observation dict matching the
-    shape ``vec_env.step()`` produces.
+    """Reset ``vec_env`` and optionally teleport the robot to ``joint_state``.
+
+    For **local** (in-process pybullet) envs the teleport fires after the reset,
+    placing the robot at the exact joint configuration requested. For **ZMQ**
+    (out-of-process) envs the teleport is silently skipped — the robot stays at
+    whatever initial pose the server loaded for this scenario.
 
     Args:
-        vec_env: A SyncVectorEnv with a single underlying SplatSim env (n_envs=1).
-        joint_state: Raw joint configuration to teleport to. Shape ``(num_dofs,)`` to
-            set arm joints only, or ``(num_dofs + 1,)`` to also set the gripper.
+        vec_env: A SyncVectorEnv with n_envs=1 wrapping a SplatSim env.
+        joint_state: Raw joint configuration to teleport to. Shape ``(num_dofs,)``
+            or ``(num_dofs + 1,)`` (with gripper). Ignored for ZMQ envs.
         num_dofs: Number of arm degrees of freedom. Defaults to 6.
+        seed: Forwarded to ``vec_env.reset(seed=seed)``. For ZMQ envs the seed
+            selects the benchmark scenario on the server side (e.g.
+            ``seed=[episode_index]``).
 
-    Notes:
-        * Object poses remain at their episode-start state — they are loaded by
-          ``reset()`` and not touched by the teleport. Acceptable for tasks where
-          objects don't move until the robot makes contact.
-        * Reaches into private attributes of ``PybulletRobotServerBase``
-          (``teleport_joint_state``, ``splatsim_robot``). The remote ZMQ backend is
-          not supported here.
+    Returns:
+        Batched gym observation dict matching the shape ``vec_env.step()`` produces.
     """
     if not hasattr(vec_env, "envs"):
-        raise TypeError(
-            "seed_splatsim_env_to_state requires a SyncVectorEnv (so we can reach "
-            f"the underlying single env). Got {type(vec_env).__name__}."
-        )
+        raise TypeError(f"seed_splatsim_env_to_state requires a SyncVectorEnv; got {type(vec_env).__name__}.")
     if len(vec_env.envs) != 1:
         raise ValueError(f"seed_splatsim_env_to_state only supports n_envs=1 (got {len(vec_env.envs)}).")
 
-    # First reset loads the EVAL_BENCHMARK scenario (object poses + episode-start joints).
-    print("[seed] vec_env.reset() …", flush=True)
-    vec_env.reset()
-    print("[seed] vec_env.reset() done", flush=True)
+    # Reset loads the benchmark scenario (object poses + episode-start robot joints).
+    env_obs, _info = vec_env.reset(seed=seed)
 
-    single_env = vec_env.envs[0]
-    # SplatSimGymEnv.unwrapped overrides gym.Env.unwrapped to return the robot_server.
-    robot_server = getattr(single_env, "robot_server", None) or single_env.unwrapped
+    # Attempt local joint teleport. Only works with the in-process pybullet backend.
+    if joint_state is not None:
+        single_env = vec_env.envs[0]
+        robot_server = getattr(single_env, "robot_server", None) or single_env.unwrapped
 
-    if not hasattr(robot_server, "teleport_joint_state"):
-        raise RuntimeError(
-            "Underlying env does not expose `teleport_joint_state` "
-            "(remote ZMQ backend or unsupported env type)."
-        )
-    if robot_server.splatsim_robot is None:
-        raise RuntimeError("robot_server.splatsim_robot is None — env not fully initialized.")
+        if hasattr(robot_server, "teleport_joint_state") and hasattr(robot_server, "splatsim_robot"):
+            js = np.asarray(joint_state, dtype=np.float64).reshape(-1)
+            n_set = min(js.shape[0], num_dofs + 1)
+            robot_server.teleport_joint_state(robot_server.splatsim_robot, js[:n_set].tolist())
+            raw_obs = robot_server.get_observations()
+            if hasattr(single_env, "_to_gym_obs"):
+                env_obs = _add_batch_dim(single_env._to_gym_obs(raw_obs))
+        else:
+            logger.debug(
+                "seed_splatsim_env_to_state: teleport_joint_state not available "
+                "(ZMQ backend?). Robot starts at episode-initial pose."
+            )
 
-    js = np.asarray(joint_state, dtype=np.float64).reshape(-1)
-    n_set = min(js.shape[0], num_dofs + 1)
-    print(f"[seed] teleport_joint_state(joints={js[:n_set].tolist()}) …", flush=True)
-    robot_server.teleport_joint_state(robot_server.splatsim_robot, js[:n_set].tolist())
-    print("[seed] teleport done; get_observations() …", flush=True)
-
-    raw_obs = robot_server.get_observations()
-    print(f"[seed] get_observations() done; keys={list(raw_obs.keys())[:10]}", flush=True)
-    gym_obs = single_env._to_gym_obs(raw_obs) if hasattr(single_env, "_to_gym_obs") else raw_obs
-    print("[seed] _to_gym_obs done", flush=True)
-    return _add_batch_dim(gym_obs)
+    return env_obs
