@@ -50,8 +50,10 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 """
 
 import concurrent.futures as cf
+import faulthandler
 import json
 import logging
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -85,7 +87,12 @@ from lerobot.envs import (
 from lerobot.envs.utils import NEW_ROLLOUT_OPTION
 from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
-from lerobot.policies.factory import _reconnect_relative_absolute_steps, _wrap_with_shared_autonomy
+from lerobot.policies.factory import (
+    _reconnect_relative_absolute_steps,
+    _wrap_with_last_mile_debug,
+    _wrap_with_shared_autonomy,
+    _wrap_with_temporal_ensemble,
+)
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
@@ -104,6 +111,30 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+# Print a Python traceback if the process receives SIGSEGV / SIGABRT / SIGFPE
+# / SIGBUS / SIGILL. Without this, native crashes (pybullet, CUDA, etc.)
+# show up as a bare "Aborted (core dumped)" in the terminal with no stack
+# trace from Python. Side-effect-only at import time; safe to call once.
+faulthandler.enable(file=sys.stderr, all_threads=True)
+
+
+def _find_last_mile_debug_wrapper(policy):
+    """Walk the wrapper chain to find a LastMileDebugWrapper instance, or None.
+
+    DEBUG helper — used to apply the last-mile oracle override in raw joint
+    space after the postprocessor. Returns None if the wrapper isn't in the
+    chain (e.g. flag disabled), so the call site is a cheap no-op when off.
+    Remove this helper when the diagnostic is gone.
+    """
+    from lerobot.policies.last_mile_debug_wrapper import LastMileDebugWrapper
+
+    p = policy
+    while p is not None:
+        if isinstance(p, LastMileDebugWrapper):
+            return p
+        p = getattr(p, "inner_policy", None)
+    return None
 
 
 def _env_features_to_dataset_features(env_features: dict) -> dict:
@@ -290,7 +321,22 @@ def rollout(
             # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
             observation = env_preprocessor(observation)
 
+            # DEBUG: snapshot raw (pre-normalization) joint state for the
+            # last-mile debug wrapper to read after the policy preprocessor
+            # has normalized the in-place value. Cheap; remove once the
+            # diagnostic is gone.
+            _raw_obs_state = observation.get("observation.state")
+            if isinstance(_raw_obs_state, torch.Tensor):
+                _raw_obs_state = _raw_obs_state.detach().clone()
+
             observation = preprocessor(observation)
+
+            # DEBUG: re-inject raw obs.state under a dedicated key so it
+            # survives the normalizer step. Read by LastMileDebugWrapper.
+            if _raw_obs_state is not None:
+                from lerobot.policies.last_mile_debug_wrapper import RAW_STATE_KEY
+
+                observation[RAW_STATE_KEY] = _raw_obs_state
 
             # Inject oracle env config AFTER the policy preprocessor, since the
             # pipeline drops keys that don't match its known observation /
@@ -308,6 +354,16 @@ def rollout(
             if predicted_latents_callback is not None:
                 predicted_latents_callback(policy)
             action = postprocessor(action)
+
+            # DEBUG: apply the last-mile oracle override in raw joint space
+            # (after the postprocessor has converted action_norm → absolute
+            # joint command). Operating here avoids a fragile inverse-
+            # normalization round-trip that would incorrectly scale on
+            # delta-action policies. The wrapper staged the override in
+            # select_action; we just consume it here.
+            _last_mile_wrapper = _find_last_mile_debug_wrapper(policy)
+            if _last_mile_wrapper is not None:
+                action = _last_mile_wrapper.apply_override(action, _raw_obs_state)
 
             action_transition = {ACTION: action}
             action_transition = env_postprocessor(action_transition)
@@ -640,6 +696,16 @@ def eval_policy(
                     batch_final_metric = metric_data[torch.arange(metric_data.size(0)), done_indices]
                     all_info_metrics[final_metric_name].extend(batch_final_metric.tolist())
 
+                    # Also track the minimum value across valid steps per episode
+                    min_metric_name = f"min_{metric_name}"
+                    if min_metric_name not in all_info_metrics:
+                        all_info_metrics[min_metric_name] = []
+                    # Set invalid steps to +inf so they don't affect the minimum
+                    data_float = metric_data.float().clone()
+                    data_float[mask == 0] = float("inf")
+                    batch_min_metric = data_float.min(dim=1).values
+                    all_info_metrics[min_metric_name].extend(batch_min_metric.tolist())
+
         if seeds:
             all_seeds.extend(seeds)
         else:
@@ -880,12 +946,31 @@ def eval_main(cfg: EvalPipelineConfig):
         preprocessor_overrides=preprocessor_overrides,
     )
 
+    # Apply temporal-ensembling FIRST (innermost wrapper) so SA, if also enabled,
+    # operates on smoothed chunks from TE's predict_action_chunk.
+    te_cfg = getattr(cfg.policy, "temporal_ensemble_config", None)
+    te_force_act = te_cfg is not None and getattr(te_cfg, "force_act_to_wrapper_mode", False)
+    legacy_act_te = (
+        getattr(cfg.policy, "type", None) == "act"
+        and getattr(cfg.policy, "temporal_ensemble_coeff", None) is not None
+        and not te_force_act  # user explicitly opted into the wrapper for ACT
+    )
+    if te_cfg is not None and te_cfg.enabled and not legacy_act_te:
+        policy = _wrap_with_temporal_ensemble(policy, cfg.policy)
+
     sa_cfg = getattr(cfg.policy, "shared_autonomy_config", None)
     if sa_cfg is not None and sa_cfg.enabled:
         policy = _wrap_with_shared_autonomy(policy, cfg.policy)
         _reconnect_relative_absolute_steps(preprocessor, policy.postprocessor, policy=policy)
     else:
         _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
+
+    # DEBUG: outermost last-mile oracle override. Applied AFTER TE+SA so it
+    # overrides whatever final action the inner stack produces. Diagnostic
+    # only — remove once the last-mile-precision hypothesis test is done.
+    last_mile_cfg = getattr(cfg.policy, "last_mile_debug_config", None)
+    if last_mile_cfg is not None and last_mile_cfg.enabled:
+        policy = _wrap_with_last_mile_debug(policy, cfg.policy)
 
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
@@ -1216,6 +1301,22 @@ def eval_policy_all(
                     _accumulate_to(tg, metrics)
                     per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
                     _save_partial_snapshot()
+                except BaseException as _eval_exc:
+                    # Print the original exception before the finally clause runs
+                    # env.close(), because close() itself can SIGABRT inside
+                    # pybullet's GUI cleanup, which would replace the original
+                    # traceback with a faulthandler trace pointing at cleanup
+                    # instead of the real cause.
+                    import traceback as _tb
+
+                    print(
+                        "\n=== task_runner raised an exception "
+                        "(printed before env.close() because close may crash natively) ===",
+                        flush=True,
+                    )
+                    _tb.print_exception(type(_eval_exc), _eval_exc, _eval_exc.__traceback__)
+                    print("=== end of original-exception traceback ===\n", flush=True)
+                    raise
                 finally:
                     if close_envs_after_eval:
                         env.close()

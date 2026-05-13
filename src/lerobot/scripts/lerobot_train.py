@@ -78,6 +78,7 @@ from lerobot.policies.factory import (
     ProcessorConfigKwargs,
     _reconnect_relative_absolute_steps,
     _wrap_with_shared_autonomy,
+    _wrap_with_temporal_ensemble,
 )
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
@@ -565,6 +566,18 @@ def train(cfg: TrainPipelineConfig):
             pretrained_revision=getattr(cfg.policy, "pretrained_revision", None),
             **processor_kwargs,
         )
+
+    # Apply temporal-ensembling FIRST (innermost wrapper) so SA, if also enabled,
+    # operates on smoothed chunks from TE's predict_action_chunk.
+    te_cfg = getattr(cfg.policy, "temporal_ensemble_config", None)
+    te_force_act = te_cfg is not None and getattr(te_cfg, "force_act_to_wrapper_mode", False)
+    legacy_act_te = (
+        getattr(cfg.policy, "type", None) == "act"
+        and getattr(cfg.policy, "temporal_ensemble_coeff", None) is not None
+        and not te_force_act  # user explicitly opted into the wrapper for ACT
+    )
+    if te_cfg is not None and te_cfg.enabled and not legacy_act_te:
+        policy = _wrap_with_temporal_ensemble(policy, cfg.policy)
 
     sa_cfg = getattr(cfg.policy, "shared_autonomy_config", None)
     if sa_cfg is not None and sa_cfg.enabled:
