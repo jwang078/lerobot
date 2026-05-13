@@ -84,6 +84,13 @@ class TeleopRecordingContext:
         # episode_metadata kwarg). None when not running under a controller
         # that knows the scenario index (e.g. interactive teleop).
         self.source_scenario_idx: int | None = None
+        # Splatsim scene configs for the current scenario. Set by the
+        # intervention controller after each env.reset() and cleared on exit.
+        # Saved into each episode's metadata so the dataset is self-contained
+        # (same fields as episodes recorded via normal data collection).
+        self.splatsim_robot_config: dict | None = None
+        self.splatsim_object_configs: list | None = None
+        self.splatsim_background_config: dict | None = None
         # When True, the recording wrapper accumulates finished episodes in
         # an in-memory pending list instead of writing them to the dataset.
         # The caller then invokes ``commit_pending_episodes()`` (save them)
@@ -296,7 +303,10 @@ class TeleopRecordingWrapper(gym.Wrapper):
             # _flush_metadata_buffer (pa.Table.from_pydict requires equal
             # column lengths) and silently strands the buffered rows.
             episode_metadata: dict | None = {
-                "source_scenario_idx": int(scenario_idx) if scenario_idx is not None else None
+                "source_scenario_idx": int(scenario_idx) if scenario_idx is not None else None,
+                "splatsim_robot_config": self._context.splatsim_robot_config,
+                "splatsim_object_configs": self._context.splatsim_object_configs,
+                "splatsim_background_config": self._context.splatsim_background_config,
             }
             if self._context.defer_episode_saves:
                 # Move the in-progress frames into the pending list and
