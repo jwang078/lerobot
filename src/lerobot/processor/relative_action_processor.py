@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,6 +27,50 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
 from .pipeline import ProcessorStep, ProcessorStepRegistry
+
+# CSV logging for debugging anchor / rel-action desync at inference time.
+# Activate by setting LEROBOT_REL_ACTION_DEBUG_LOG=/path/to/file.csv before running eval.
+# Each call to the relative or absolute processor appends one row.
+_DEBUG_LOG_PATH = os.environ.get("LEROBOT_REL_ACTION_DEBUG_LOG")
+_DEBUG_LOG_FILE: Any = None
+_DEBUG_LOG_INIT = False
+
+
+def _debug_log(event: str, **fields: Any) -> None:
+    """Append a row to the debug CSV. Lazy-opens the file on first call."""
+    global _DEBUG_LOG_FILE, _DEBUG_LOG_INIT
+    if _DEBUG_LOG_PATH is None:
+        return
+    if not _DEBUG_LOG_INIT:
+        os.makedirs(os.path.dirname(_DEBUG_LOG_PATH) or ".", exist_ok=True)
+        _DEBUG_LOG_FILE = open(_DEBUG_LOG_PATH, "w", buffering=1)  # noqa: SIM115 - long-lived log handle, closed by process exit
+        _DEBUG_LOG_FILE.write(
+            "ts,event,state,anchor,rel_action,abs_action,queue_empty,has_action,did_cache_update\n"
+        )
+        _DEBUG_LOG_INIT = True
+
+    def _fmt(v):
+        if v is None:
+            return ""
+        if torch.is_tensor(v):
+            v = v.detach().cpu().flatten().tolist()
+        if isinstance(v, (list, tuple)):
+            return "[" + ";".join(f"{x:.6f}" for x in v) + "]"
+        return str(v)
+
+    row = [
+        f"{time.time():.6f}",
+        event,
+        _fmt(fields.get("state")),
+        _fmt(fields.get("anchor")),
+        _fmt(fields.get("rel_action")),
+        _fmt(fields.get("abs_action")),
+        _fmt(fields.get("queue_empty")),
+        _fmt(fields.get("has_action")),
+        _fmt(fields.get("did_cache_update")),
+    ]
+    _DEBUG_LOG_FILE.write(",".join(row) + "\n")
+
 
 # Re-export for backward compatibility
 __all__ = [
@@ -124,22 +170,32 @@ class RelativeActionsProcessorStep(ProcessorStep):
         - ``self._action_queue`` (deque): act, pi0, pi05, pi0_fast, groot
         - ``self._queues[ACTION]`` (deque): diffusion, smolvla, vqbet,
           wall_x, xvla, multi_task_dit, tdmpc
-        Unwraps wrappers exposing ``inner_policy`` (e.g. SharedAutonomyPolicyWrapper).
+
+        Walks through wrappers exposing ``inner_policy`` (e.g.
+        ``SharedAutonomyPolicyWrapper``, ``TemporalEnsemblePolicyWrapper``)
+        and returns the queue state at the *outermost* level that has one.
+        This lets wrappers that override chunk-boundary semantics (like TE,
+        which exposes its own ``_action_queue`` proxy backed by an intra-
+        chunk counter) intercept the check before the walk descends into
+        the underlying policy. Backward-compatible: wrappers without a
+        queue attribute continue to forward through.
         """
         policy = self._policy
         if policy is None:
             return True
-        while hasattr(policy, "inner_policy"):
-            policy = policy.inner_policy
-        action_queue = getattr(policy, "_action_queue", None)
-        if action_queue is not None:
-            return len(action_queue) == 0
-        queues_dict = getattr(policy, "_queues", None)
-        if queues_dict is not None:
-            action_q = queues_dict.get(ACTION) if hasattr(queues_dict, "get") else None
-            if action_q is not None:
-                return len(action_q) == 0
-        return True
+        while True:
+            action_queue = getattr(policy, "_action_queue", None)
+            if action_queue is not None:
+                return len(action_queue) == 0
+            queues_dict = getattr(policy, "_queues", None)
+            if queues_dict is not None:
+                action_q = queues_dict.get(ACTION) if hasattr(queues_dict, "get") else None
+                if action_q is not None:
+                    return len(action_q) == 0
+            if hasattr(policy, "inner_policy"):
+                policy = policy.inner_policy
+            else:
+                return True
 
     def _build_mask(self, action_dim: int) -> list[bool]:
         if not self.exclude_joints or self.action_names is None:
@@ -172,8 +228,23 @@ class RelativeActionsProcessorStep(ProcessorStep):
         # queue is empty, i.e. a fresh chunk is about to be predicted. Otherwise
         # mid-chunk preprocessor calls would overwrite the anchor with stale
         # per-step state, producing wrong absolute actions for chunk[1..n-1].
-        if state is not None and (has_action or self._policy_queue_empty()):
+        queue_empty = self._policy_queue_empty()
+        did_cache_update = state is not None and (has_action or queue_empty)
+        if did_cache_update:
             self._last_state = state
+
+        # Log every preprocessor call so we can audit cache-update timing vs the
+        # state the model is conditioning on this same call.
+        _debug_log(
+            "preproc",
+            state=state[..., -1, :] if state is not None and state.ndim == 3 else state,
+            anchor=self._last_state[..., -1, :]
+            if self._last_state is not None and self._last_state.ndim == 3
+            else self._last_state,
+            queue_empty=queue_empty,
+            has_action=has_action,
+            did_cache_update=did_cache_update,
+        )
 
         if not self.enabled:
             return transition
@@ -245,9 +316,19 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
             return new_transition
 
         mask = self.relative_step._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_absolute_actions(
-            action, self.relative_step._last_state, mask
+        abs_action = to_absolute_actions(action, self.relative_step._last_state, mask)
+        new_transition[TransitionKey.ACTION] = abs_action
+
+        anchor = self.relative_step._last_state
+        if anchor is not None and anchor.ndim == 3:
+            anchor = anchor[..., -1, :]
+        _debug_log(
+            "postproc",
+            anchor=anchor,
+            rel_action=action,
+            abs_action=abs_action,
         )
+
         return new_transition
 
     def get_config(self) -> dict[str, Any]:

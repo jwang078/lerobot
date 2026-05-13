@@ -17,7 +17,9 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
+from lerobot.configs.last_mile_debug import LastMileDebugConfig
 from lerobot.configs.shared_autonomy import SharedAutonomyConfig
+from lerobot.configs.temporal_ensemble import TemporalEnsembleConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
@@ -62,6 +64,15 @@ class PI05Config(PreTrainedConfig):
 
     # Shared Autonomy configuration
     shared_autonomy_config: SharedAutonomyConfig | None = None
+
+    # Temporal-ensembling configuration (policy-agnostic wrapper applied
+    # post-factory; pure inference-time smoothing of chunk boundaries).
+    temporal_ensemble_config: TemporalEnsembleConfig | None = None
+
+    # DEBUG / diagnostic: oracle last-mile override. Disabled by default;
+    # remove this field, the wrapper, and the factory wiring once the
+    # last-mile-precision hypothesis test is complete.
+    last_mile_debug_config: LastMileDebugConfig | None = None
 
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,

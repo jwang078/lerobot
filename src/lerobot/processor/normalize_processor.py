@@ -95,6 +95,14 @@ class _NormalizationMixin:
     device: torch.device | str | None = None
     dtype: torch.dtype | None = None
     eps: float = 1e-8
+    # When not None, replaces ``eps`` as the QUANTILES denominator fallback for
+    # zero-variance dimensions (where q99 - q01 ≈ 0). The original lerobot
+    # behaviour uses ``eps`` (~1e-8) which maps any non-zero input to ~1e8,
+    # corrupting downstream models. Setting this to 2.0 keeps the normalised
+    # value for zero-variance inputs at -1 (matching training) while mapping
+    # non-zero guidance values to a finite, in-distribution range.
+    # Default None preserves original lerobot behaviour.
+    zero_variance_denom: float | None = None
     normalize_observation_keys: set[str] | None = None
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
@@ -372,10 +380,16 @@ class _NormalizationMixin:
 
             denom = q99 - q01
             # Avoid division by zero/near-zero when quantiles are identical or nearly so
-            # (e.g. a dimension with zero variance in training data produces q99-q01 ~ 1e-14)
+            # (e.g. a dimension with zero variance in training data produces q99-q01 ~ 1e-14).
+            # ``zero_variance_denom`` (if set) is used as the replacement instead of eps.
+            # Using eps as replacement maps any non-zero input to ~1/eps (e.g. 1e8), which
+            # corrupts downstream models. Using a finite fallback (e.g. 2.0) keeps the
+            # normalised value for zero inputs at -1 (matching training) while mapping
+            # non-zero guidance values to a finite, in-distribution range.
+            fallback = self.zero_variance_denom if self.zero_variance_denom is not None else self.eps
             denom = torch.where(
                 denom.abs() < self.eps,
-                torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype),
+                torch.tensor(fallback, device=tensor.device, dtype=tensor.dtype),
                 denom,
             )
             if inverse:

@@ -16,6 +16,8 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
+from lerobot.configs.last_mile_debug import LastMileDebugConfig
+from lerobot.configs.temporal_ensemble import TemporalEnsembleConfig
 from lerobot.optim import AdamWConfig
 
 
@@ -116,7 +118,22 @@ class ACTConfig(PreTrainedConfig):
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
+    # LEGACY inline path. Kept for backward compatibility with existing
+    # checkpoints; new code should prefer the policy-agnostic
+    # ``temporal_ensemble_config`` below (which applies the same algorithm via
+    # ``TemporalEnsemblePolicyWrapper`` and works for pi05/diffusion as well).
+    # If both are set, the legacy inline path wins and a DeprecationWarning is
+    # logged from ``__post_init__``.
     temporal_ensemble_coeff: float | None = None
+
+    # Policy-agnostic temporal-ensembling wrapper config. When ``enabled``,
+    # ``TemporalEnsemblePolicyWrapper`` is applied at factory time.
+    temporal_ensemble_config: TemporalEnsembleConfig | None = None
+
+    # DEBUG / diagnostic: oracle last-mile override. Disabled by default;
+    # remove this field, the wrapper, and the factory wiring once the
+    # last-mile-precision hypothesis test is complete.
+    last_mile_debug_config: LastMileDebugConfig | None = None
 
     # Training and loss computation.
     dropout: float = 0.1
@@ -139,6 +156,24 @@ class ACTConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
                 "because the policy needs to be queried every step to compute the ensembled action."
+            )
+        if (
+            self.temporal_ensemble_coeff is not None
+            and self.temporal_ensemble_config is not None
+            and self.temporal_ensemble_config.enabled
+            and not self.temporal_ensemble_config.force_act_to_wrapper_mode
+        ):
+            import warnings
+
+            warnings.warn(
+                "Both ACTConfig.temporal_ensemble_coeff (legacy inline path) and "
+                "ACTConfig.temporal_ensemble_config.enabled (new wrapper) are set. "
+                "The inline path takes priority for backward compatibility; the "
+                "wrapper will not be applied. Set temporal_ensemble_coeff=None or "
+                "temporal_ensemble_config.force_act_to_wrapper_mode=true to use "
+                "the new wrapper.",
+                DeprecationWarning,
+                stacklevel=2,
             )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(

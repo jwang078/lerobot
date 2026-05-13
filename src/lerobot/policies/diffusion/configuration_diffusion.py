@@ -17,7 +17,9 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
+from lerobot.configs.last_mile_debug import LastMileDebugConfig
 from lerobot.configs.shared_autonomy import SharedAutonomyConfig
+from lerobot.configs.temporal_ensemble import TemporalEnsembleConfig
 from lerobot.optim import AdamConfig, DiffuserSchedulerConfig
 
 
@@ -152,6 +154,15 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Shared autonomy
     shared_autonomy_config: SharedAutonomyConfig | None = None
+
+    # Temporal-ensembling configuration (policy-agnostic wrapper applied
+    # post-factory; pure inference-time smoothing of chunk boundaries).
+    temporal_ensemble_config: TemporalEnsembleConfig | None = None
+
+    # DEBUG / diagnostic: oracle last-mile override. Disabled by default;
+    # remove this field, the wrapper, and the factory wiring once the
+    # last-mile-precision hypothesis test is complete.
+    last_mile_debug_config: LastMileDebugConfig | None = None
 
     # Loss computation
     do_mask_loss_for_padding: bool = False

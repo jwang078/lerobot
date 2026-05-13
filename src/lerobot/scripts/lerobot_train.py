@@ -48,7 +48,11 @@ from lerobot.datasets.io_utils import cast_stats_to_numpy
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
-from lerobot.policies.factory import _reconnect_relative_absolute_steps, _wrap_with_shared_autonomy
+from lerobot.policies.factory import (
+    _reconnect_relative_absolute_steps,
+    _wrap_with_shared_autonomy,
+    _wrap_with_temporal_ensemble,
+)
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import load_json
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
@@ -338,6 +342,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+
+    # Apply temporal-ensembling FIRST (innermost wrapper) so SA, if also enabled,
+    # operates on smoothed chunks from TE's predict_action_chunk.
+    te_cfg = getattr(cfg.policy, "temporal_ensemble_config", None)
+    te_force_act = te_cfg is not None and getattr(te_cfg, "force_act_to_wrapper_mode", False)
+    legacy_act_te = (
+        getattr(cfg.policy, "type", None) == "act"
+        and getattr(cfg.policy, "temporal_ensemble_coeff", None) is not None
+        and not te_force_act  # user explicitly opted into the wrapper for ACT
+    )
+    if te_cfg is not None and te_cfg.enabled and not legacy_act_te:
+        policy = _wrap_with_temporal_ensemble(policy, cfg.policy)
 
     sa_cfg = getattr(cfg.policy, "shared_autonomy_config", None)
     if sa_cfg is not None and sa_cfg.enabled:

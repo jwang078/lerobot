@@ -646,12 +646,18 @@ def _wrap_with_shared_autonomy(policy, cfg):
     features = postprocessor_features or cfg.output_features
     norm_map = postprocessor_norm_map or cfg.normalization_mapping
 
-    # Build inverse postprocessor: normalizes raw actions to policy's internal space
+    # Build inverse postprocessor: normalizes raw actions to policy's internal space.
+    # Use zero_variance_denom=2.0 so that action dimensions with zero training
+    # variance (e.g. gripper always 0) map non-zero guidance values to finite
+    # normalised values instead of ~1/eps (≈1e8), which would corrupt the denoiser.
+    # This only affects QUANTILES dimensions where q99-q01 ≈ 0; all other dims
+    # are unchanged. Standard lerobot train/eval paths leave zero_variance_denom=None.
     inverse_steps = [
         NormalizerProcessorStep(
             features=features,
             norm_map=norm_map,
             stats=postprocessor_stats,
+            zero_variance_denom=2.0,
         ),
         DeviceProcessorStep(device=cfg.device),
     ]
@@ -726,6 +732,79 @@ def _wrap_with_shared_autonomy(policy, cfg):
 
     logging.info(
         f"Wrapped policy with SharedAutonomyPolicyWrapper (forward_flow_ratio={sa_cfg.forward_flow_ratio})"
+    )
+    return wrapped
+
+
+def _wrap_with_temporal_ensemble(policy, cfg):
+    """Wrap a policy with TemporalEnsemblePolicyWrapper.
+
+    Pure inference-time smoothing of chunk boundaries via online
+    exponentially-weighted averaging of overlapping chunks (ACT's Algorithm 2,
+    generalised to any chunk-predicting policy).
+
+    Validates ``n_action_steps <= chunk_size``. Smaller ``n_action_steps``
+    gives more smoothing at higher inference cost; ``n_action_steps=1`` is
+    the maximum-smoothness setting and queries the model every step.
+    """
+    from lerobot.policies.temporal_ensemble_wrapper import TemporalEnsemblePolicyWrapper
+
+    te_cfg = cfg.temporal_ensemble_config
+    chunk_size = getattr(cfg, "chunk_size", None)
+    n_action_steps = getattr(cfg, "n_action_steps", 1)
+    if chunk_size is not None and n_action_steps >= chunk_size:
+        # With n_action_steps == chunk_size the wrapper consumes every entry
+        # from the smoothed buffer before the next update; the next update
+        # then sees an empty buffer (after skip(K-1) = skip(chunk_size-1)) and
+        # appends the new chunk as fresh entries with count=1. No averaging
+        # ever happens — the wrapper degenerates to "no smoothing." Block this
+        # so users don't silently get a no-op.
+        raise ValueError(
+            f"temporal_ensemble_config.enabled=True requires n_action_steps "
+            f"({n_action_steps}) < chunk_size ({chunk_size}) — when equal, the "
+            f"ensembler buffer empties between chunks and no smoothing occurs. "
+            f"Lower n_action_steps to get chunk_size/n_action_steps averaged "
+            f"predictions per future timestep (n_action_steps=1 = maximum smoothing)."
+        )
+    if n_action_steps != 1:
+        logging.warning(
+            "TemporalEnsemble: inner policy has n_action_steps=%d. The wrapper supports "
+            "K>1 via ensembler.skip(), but smaller K gives MORE smoothing (more averaged "
+            "predictions per future timestep). For maximum smoothness pass "
+            "`--policy.n_action_steps=1` explicitly.",
+            n_action_steps,
+        )
+    wrapped = TemporalEnsemblePolicyWrapper(policy, te_cfg)
+    logging.info(
+        "Wrapped policy with TemporalEnsemblePolicyWrapper (coeff=%.4f, n_action_steps=%d)",
+        te_cfg.coeff,
+        n_action_steps,
+    )
+    return wrapped
+
+
+def _wrap_with_last_mile_debug(policy, cfg):
+    """DEBUG: wrap a policy with LastMileDebugWrapper.
+
+    Eval-time oracle override that pulls commanded joint targets toward
+    ``oracle_env_config.task.q_goal_bias`` when the robot is within
+    ``ee_distance_threshold`` of the goal (EE-space, meters). Diagnostic only
+    — depends on splatsim's q_goal_bias + current_ee_pos being present in
+    the oracle env config. Remove this function (and its call sites) once
+    the diagnostic is complete.
+
+    The override is staged here in the wrapper but APPLIED by lerobot_eval
+    after the postprocessor (raw joint space), via ``wrapper.apply_override``.
+    """
+    from lerobot.policies.last_mile_debug_wrapper import LastMileDebugWrapper
+
+    debug_cfg = cfg.last_mile_debug_config
+    wrapped = LastMileDebugWrapper(inner_policy=policy, debug_cfg=debug_cfg)
+    logging.info(
+        "Wrapped policy with LastMileDebugWrapper [DIAGNOSTIC] "
+        "(ee_distance_threshold=%.4f m, blend_alpha=%.2f)",
+        debug_cfg.ee_distance_threshold,
+        debug_cfg.blend_alpha,
     )
     return wrapped
 
