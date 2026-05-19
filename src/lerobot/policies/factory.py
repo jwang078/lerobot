@@ -722,6 +722,10 @@ def _wrap_with_shared_autonomy(policy, cfg):
         blend_mode=sa_cfg.blend_mode,
         n_anchor_steps=sa_cfg.n_anchor_steps,
         fps=sa_cfg.fps,
+        rrt_pre_jump_lookback_steps=sa_cfg.rrt_pre_jump_lookback_steps,
+        rrt_teleport_to_q_start=sa_cfg.rrt_teleport_to_q_start,
+        rrt_blocking_plan=sa_cfg.rrt_blocking_plan,
+        rrt_path_selection=sa_cfg.rrt_path_selection,
     )
 
     # Connect shared context for teleop recording (if active)

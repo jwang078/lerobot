@@ -35,19 +35,64 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-class FrameSource(Enum):
-    """Origin of an action sample, used by the recorder to decide whether to keep it.
+# Origin of an action sample, used by the recorder to decide whether to keep it.
+#
+# Built with the Enum functional API because we want a 101-member family
+# `BLEND_INTERVENTION_<pct>` alongside the 4 base values. Enumerating those
+# 101 members by hand would be untenable; the comprehension below generates
+# them at module load time.
+#
+# Members:
+#   TELEOP / RRT             — "real" frames, always committed to the dataset.
+#   POLICY                   — skipped, except when ratio==0 (committed for
+#                              legacy callers that haven't migrated to TELEOP).
+#   PADDING                  — post-teleop pad-to-min frames; committed only
+#                              to reach min_episode_length.
+#   BLEND_INTERVENTION_000   — controller-driven blend at ratio=0.00; committed.
+#   BLEND_INTERVENTION_001   — ratio=0.01; committed.
+#   ...                        (101 members total, 0..100)
+#   BLEND_INTERVENTION_100   — ratio=1.00 (verbatim controller drive); committed.
+#
+# OracleGoalGuidanceSource (Step 5) emits one of the BLEND_INTERVENTION_<pct>
+# members depending on the wrapper's `forward_flow_ratio` at the time of the
+# frame. The downstream dataset can then filter / weight by ratio.
+_FRAME_SOURCE_BASE = {"TELEOP": "teleop", "RRT": "rrt", "POLICY": "policy", "PADDING": "padding"}
+_FRAME_SOURCE_BLEND = {f"BLEND_INTERVENTION_{i:03d}": f"blend_intervention_{i:03d}" for i in range(101)}
+FrameSource = Enum(  # type: ignore[misc]
+    "FrameSource",
+    {**_FRAME_SOURCE_BASE, **_FRAME_SOURCE_BLEND},
+    module=__name__,
+)
 
-    TELEOP and RRT are "real" frames that count toward ``min_episode_length`` and
-    are committed to the dataset. POLICY frames are skipped (not recorded). PADDING
-    is reserved for the post-teleop pad-to-min behaviour and is committed only to
-    reach the threshold.
+
+def _blend_at_ratio(cls, ratio: float) -> FrameSource:  # type: ignore[valid-type]
+    """Return the `BLEND_INTERVENTION_<pct>` member for the given ratio in [0, 1].
+
+    Ratio is clamped to [0, 1] and rounded to 2 decimal places, then formatted
+    as a 3-digit zero-padded integer matching the enum member naming. Examples:
+        0.00 → BLEND_INTERVENTION_000
+        0.65 → BLEND_INTERVENTION_065
+        1.00 → BLEND_INTERVENTION_100
     """
+    idx = int(round(max(0.0, min(1.0, float(ratio))) * 100))
+    return cls[f"BLEND_INTERVENTION_{idx:03d}"]
 
-    TELEOP = "teleop"
-    RRT = "rrt"
-    POLICY = "policy"
-    PADDING = "padding"
+
+FrameSource.blend_at_ratio = classmethod(_blend_at_ratio)  # type: ignore[attr-defined]
+
+
+def is_committed_frame_source(source, ratio: float) -> bool:
+    """Recorder-side filter: True iff a frame with the given source should be committed.
+
+    Centralized here so the wrapper's step() and any future readers stay in sync.
+    The legacy `POLICY + ratio==0` case is preserved for callers that haven't
+    migrated to setting a more specific source.
+    """
+    if source in (FrameSource.TELEOP, FrameSource.RRT):
+        return True
+    if source.name.startswith("BLEND_INTERVENTION_"):
+        return True
+    return source is FrameSource.POLICY and ratio == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +184,7 @@ class TeleopRecordingWrapper(gym.Wrapper):
         image_keys: list[str],
         task: str,
         min_episode_length: int = 60,
+        push_to_hub: bool = True,
     ) -> None:
         super().__init__(env)
         self._context = context
@@ -146,6 +192,11 @@ class TeleopRecordingWrapper(gym.Wrapper):
         self._image_keys = image_keys
         self._task = task
         self._min_episode_length = min_episode_length
+        # When False, finalize the dataset locally but skip the
+        # `self._dataset.push_to_hub()` call in close(). Useful for offline
+        # pipelines (e.g. the DAgger orchestrator) that don't want to round-
+        # trip each round's intervention dataset through HuggingFace Hub.
+        self._push_to_hub = push_to_hub
 
         self._recording: bool = False
         self._padding: bool = False
@@ -434,13 +485,11 @@ class TeleopRecordingWrapper(gym.Wrapper):
             self._context.discard_requested = False
 
         # A frame is "real" (counts toward min_episode_length, gets saved as a
-        # genuine sample) when its source is either pure-teleop or RRT-to-goal.
-        # Falling back to ratio==0.0 keeps the legacy contract for callers that
-        # haven't been updated to set frame_source.
+        # genuine sample) when its source is TELEOP, RRT, any BLEND_INTERVENTION_<pct>,
+        # or POLICY+ratio==0 (legacy contract for callers that haven't migrated).
+        # See `is_committed_frame_source` in this module.
         source = self._context.frame_source
-        is_real_frame = source in (FrameSource.TELEOP, FrameSource.RRT) or (
-            source is FrameSource.POLICY and self._context.ratio == 0.0
-        )
+        is_real_frame = is_committed_frame_source(source, self._context.ratio)
 
         if is_real_frame:
             if self._padding:
@@ -490,6 +539,13 @@ class TeleopRecordingWrapper(gym.Wrapper):
         try:
             finalize_lerobot_dataset(self._dataset)
             logger.info("[TeleopRecording] Dataset finalised.")
+            if not self._push_to_hub:
+                logger.info(
+                    "[TeleopRecording] Skipping Hub push (push_to_hub=False); "
+                    f"dataset is local at {self._dataset.root}"
+                )
+                super().close()
+                return
             logger.info(f"[TeleopRecording] Pushing dataset to hub as '{self._dataset.repo_id}'...")
             self._dataset.push_to_hub()
             logger.info("[TeleopRecording] Successfully pushed to hub.")
