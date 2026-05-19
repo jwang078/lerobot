@@ -783,29 +783,46 @@ def _wrap_with_temporal_ensemble(policy, cfg):
     return wrapped
 
 
-def _wrap_with_last_mile_debug(policy, cfg):
-    """DEBUG: wrap a policy with LastMileDebugWrapper.
+def _wrap_with_last_mile(policy, cfg):
+    """Wrap a policy with LastMileWrapper.
 
-    Eval-time oracle override that pulls commanded joint targets toward
-    ``oracle_env_config.task.q_goal_bias`` when the robot is within
-    ``ee_distance_threshold`` of the goal (EE-space, meters). Diagnostic only
-    — depends on splatsim's q_goal_bias + current_ee_pos being present in
-    the oracle env config. Remove this function (and its call sites) once
-    the diagnostic is complete.
+    Eval-time help mechanism with pluggable detect + help backends. See
+    ``lerobot.configs.last_mile.LastMileConfig`` for the backend list and
+    per-backend params. The help is staged in the wrapper's ``select_action``
+    and APPLIED by lerobot_eval after the postprocessor (raw joint space),
+    via ``wrapper.apply_help``.
 
-    The override is staged here in the wrapper but APPLIED by lerobot_eval
-    after the postprocessor (raw joint space), via ``wrapper.apply_override``.
+    When ``help_backend == "rrt_to_goal"``, an outer ``SharedAutonomyPolicyWrapper``
+    must already be in the stack — the RRT helper delegates to its
+    ``trigger_rrt_to_goal`` / ``is_rrt_active``. The factory walks the inner
+    policy chain to find SA and registers it on the wrapper. Raises if SA is
+    not found.
     """
-    from lerobot.policies.last_mile_debug_wrapper import LastMileDebugWrapper
+    from lerobot.policies.last_mile import LastMileWrapper
+    from lerobot.policies.shared_autonomy_wrapper import SharedAutonomyPolicyWrapper
 
-    debug_cfg = cfg.last_mile_debug_config
-    wrapped = LastMileDebugWrapper(inner_policy=policy, debug_cfg=debug_cfg)
+    last_mile_cfg = cfg.last_mile_config
+    wrapped = LastMileWrapper(inner_policy=policy, cfg=last_mile_cfg)
     logging.info(
-        "Wrapped policy with LastMileDebugWrapper [DIAGNOSTIC] "
-        "(ee_distance_threshold=%.4f m, blend_alpha=%.2f)",
-        debug_cfg.ee_distance_threshold,
-        debug_cfg.blend_alpha,
+        "Wrapped policy with LastMileWrapper (detect=%s, help=%s)",
+        last_mile_cfg.detect_backend,
+        last_mile_cfg.help_backend,
     )
+
+    if last_mile_cfg.help_backend == "rrt_to_goal":
+        # Walk the wrapper chain for an SA wrapper.
+        sa = policy
+        while sa is not None and not isinstance(sa, SharedAutonomyPolicyWrapper):
+            sa = getattr(sa, "inner_policy", None)
+        if sa is None:
+            raise ValueError(
+                "LastMileConfig.help_backend='rrt_to_goal' requires a "
+                "SharedAutonomyPolicyWrapper to also be enabled (set "
+                "shared_autonomy_config.enabled=true)."
+            )
+        wrapped.register_sa_wrapper(sa)
+        logging.info("LastMileWrapper: registered SharedAutonomyPolicyWrapper for RRT help.")
+
     return wrapped
 
 

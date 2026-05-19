@@ -17,7 +17,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
-from lerobot.configs.last_mile_debug import LastMileDebugConfig
+from lerobot.configs.last_mile import LastMileConfig
 from lerobot.configs.shared_autonomy import SharedAutonomyConfig
 from lerobot.configs.temporal_ensemble import TemporalEnsembleConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -69,10 +69,9 @@ class PI05Config(PreTrainedConfig):
     # post-factory; pure inference-time smoothing of chunk boundaries).
     temporal_ensemble_config: TemporalEnsembleConfig | None = None
 
-    # DEBUG / diagnostic: oracle last-mile override. Disabled by default;
-    # remove this field, the wrapper, and the factory wiring once the
-    # last-mile-precision hypothesis test is complete.
-    last_mile_debug_config: LastMileDebugConfig | None = None
+    # Last-mile help wrapper config. Eval-time override that detects when
+    # the inner policy needs help and intervenes. Disabled by default.
+    last_mile_config: LastMileConfig | None = None
 
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
