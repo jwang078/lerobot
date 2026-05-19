@@ -64,7 +64,10 @@ from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from pprint import pformat
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
+
+if TYPE_CHECKING:
+    from lerobot.scripts.intervention_controller import InterventionContext
 
 import einops
 import gymnasium as gym
@@ -86,7 +89,7 @@ from lerobot.envs import (
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.policies.factory import (
     _reconnect_relative_absolute_steps,
-    _wrap_with_last_mile_debug,
+    _wrap_with_last_mile,
     _wrap_with_shared_autonomy,
     _wrap_with_temporal_ensemble,
 )
@@ -109,19 +112,35 @@ from lerobot.utils.utils import (
 faulthandler.enable(file=sys.stderr, all_threads=True)
 
 
-def _find_last_mile_debug_wrapper(policy):
-    """Walk the wrapper chain to find a LastMileDebugWrapper instance, or None.
+def _find_last_mile_wrapper(policy):
+    """Walk the wrapper chain to find a LastMileWrapper instance, or None.
 
-    DEBUG helper — used to apply the last-mile oracle override in raw joint
-    space after the postprocessor. Returns None if the wrapper isn't in the
-    chain (e.g. flag disabled), so the call site is a cheap no-op when off.
-    Remove this helper when the diagnostic is gone.
+    Used to apply the last-mile help in raw joint space after the
+    postprocessor. Returns None if the wrapper isn't in the chain (e.g. flag
+    disabled), so the call site is a cheap no-op when off.
     """
-    from lerobot.policies.last_mile_debug_wrapper import LastMileDebugWrapper
+    from lerobot.policies.last_mile import LastMileWrapper
 
     p = policy
     while p is not None:
-        if isinstance(p, LastMileDebugWrapper):
+        if isinstance(p, LastMileWrapper):
+            return p
+        p = getattr(p, "inner_policy", None)
+    return None
+
+
+def _find_shared_autonomy_wrapper(policy):
+    """Walk the wrapper chain to find a SharedAutonomyPolicyWrapper instance, or None.
+
+    Used in intervention mode to set headless flags (`auto_pause_on_rrt_finish`,
+    `_run_event.set()`) and to hand the env handle to the RRT source's
+    pre-execution teleport.
+    """
+    from lerobot.policies.shared_autonomy_wrapper import SharedAutonomyPolicyWrapper
+
+    p = policy
+    while p is not None:
+        if isinstance(p, SharedAutonomyPolicyWrapper):
             return p
         p = getattr(p, "inner_policy", None)
     return None
@@ -137,6 +156,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    intervention_ctx: "InterventionContext | None" = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -176,6 +196,44 @@ def rollout(
     observation, info = env.reset(seed=seeds)
     if render_callback is not None:
         render_callback(env)
+
+    # ── intervention-mode per-scenario setup ──────────────────────────────── #
+    # When `intervention_ctx` is set, lerobot-eval is running single-env
+    # per-scenario mode (validated upstream). For this rollout call:
+    #   * reset the controller (each rollout() invocation = one scenario)
+    #   * advertise the scenario index to the TeleopRecordingContext so the
+    #     recorder tags committed episodes with it
+    #   * push splatsim scene metadata so the dataset captures it per-episode
+    #   * flip the recorder into defer-commit mode (commit only on success;
+    #     discard on failure)
+    if intervention_ctx is not None:
+        assert env.num_envs == 1, (
+            f"Intervention mode requires env.num_envs=1, got {env.num_envs} (should have been caught upstream)."
+        )
+        ictrl = intervention_ctx.controller
+        iteleop = intervention_ctx.teleop_context
+        ictrl.reset_for_new_scenario()
+        # scenario_idx counts ALL rollout() calls (whether the episode
+        # ultimately commits or discards). Matches the for-loop variable
+        # semantics from the legacy intervention_record.py rollout.
+        iteleop.source_scenario_idx = intervention_ctx.scenario_idx
+        iteleop.defer_episode_saves = True
+        try:
+            env_cfgs = env.call("get_env_config")
+            env_cfg_one = env_cfgs[0] if env_cfgs else None
+        except Exception:
+            logging.warning(
+                "Could not fetch splatsim metadata from env; per-episode metadata will be incomplete."
+            )
+            env_cfg_one = None
+        if env_cfg_one is not None:
+            iteleop.splatsim_robot_config = env_cfg_one.get("splatsim_robot_config")
+            iteleop.splatsim_object_configs = env_cfg_one.get("splatsim_object_configs")
+            iteleop.splatsim_background_config = env_cfg_one.get("splatsim_background_config")
+        else:
+            iteleop.splatsim_robot_config = None
+            iteleop.splatsim_object_configs = None
+            iteleop.splatsim_background_config = None
 
     all_observations = []
     all_actions = []
@@ -223,10 +281,10 @@ def rollout(
 
         observation = preprocessor(observation)
 
-        # DEBUG: re-inject raw obs.state under a dedicated key so it survives
-        # the normalizer step. Read by LastMileDebugWrapper.
+        # Re-inject raw obs.state under a dedicated key so it survives
+        # the normalizer step. Read by LastMileWrapper.
         if _raw_obs_state is not None:
-            from lerobot.policies.last_mile_debug_wrapper import RAW_STATE_KEY
+            from lerobot.policies.last_mile import RAW_STATE_KEY
 
             observation[RAW_STATE_KEY] = _raw_obs_state
 
@@ -248,14 +306,14 @@ def rollout(
             action = policy.select_action(observation)
         action = postprocessor(action)
 
-        # DEBUG: apply the last-mile oracle override in raw joint space (after
-        # the postprocessor has converted action_norm → absolute joint command).
-        # Operating here avoids a fragile inverse-normalization round-trip that
-        # would incorrectly scale on delta-action policies. The wrapper staged the
-        # override in select_action; we just consume it here.
-        _last_mile_wrapper = _find_last_mile_debug_wrapper(policy)
+        # Apply the last-mile help in raw joint space (after the postprocessor
+        # has converted action_norm → absolute joint command). Operating here
+        # avoids a fragile inverse-normalization round-trip that would
+        # incorrectly scale on delta-action policies. The wrapper staged the
+        # help in select_action; we just consume it here.
+        _last_mile_wrapper = _find_last_mile_wrapper(policy)
         if _last_mile_wrapper is not None:
-            action = _last_mile_wrapper.apply_override(action, _raw_obs_state)
+            action = _last_mile_wrapper.apply_help(action, _raw_obs_state)
 
         action_transition = {ACTION: action}
         action_transition = env_postprocessor(action_transition)
@@ -288,6 +346,23 @@ def rollout(
             )
         else:
             successes = [False] * env.num_envs
+
+        # ── intervention-mode tick ───────────────────────────────────────── #
+        # The controller drives policy/intervention alternation: stall +
+        # collision triggers, plan-failure backoff, controller-initiated
+        # cancel after a random waypoint budget. A "advance" decision means
+        # "this scenario is done" — mark all envs done to exit the loop.
+        if intervention_ctx is not None:
+            from lerobot.scripts.intervention_controller import (
+                _extract_in_collision,
+                _extract_success,
+            )
+
+            scn_success = _extract_success(info)
+            in_collision = _extract_in_collision(info)
+            decision = intervention_ctx.controller.tick(success=scn_success, in_collision=in_collision)
+            if decision == "advance":
+                done = np.ones_like(done, dtype=bool)
 
         # Keep track of which environments are done so far.
         # Mark the episode as done if we reach the maximum step limit.
@@ -359,6 +434,48 @@ def rollout(
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
 
+    # ── intervention-mode post-rollout: commit/discard + CSV row ─────────── #
+    # Reads ``all_successes`` to determine the scenario verdict. If the env
+    # reported success at any point during the rollout, commit the buffered
+    # episodes (the recorder accumulated them under teleop_ctx with
+    # defer_episode_saves=True). Otherwise discard them so failed-correction
+    # frames don't pollute the DAgger dataset.
+    if intervention_ctx is not None:
+        # ``all_successes`` is a list of [B]-shaped tensors; we have B==1 so
+        # check if any tick reported success.
+        scn_success = bool(torch.stack(all_successes, dim=1).any().item()) if all_successes else False
+
+        # Force any in-progress recorded frames (e.g. env declared success
+        # mid-intervention and we broke out before the wrapper saw
+        # frame_source transition back to POLICY) into pending_episodes
+        # under the still-set source_scenario_idx, before commit/discard.
+        try:
+            env.call("flush_in_progress_episode")
+        except Exception:
+            logging.exception("flush_in_progress_episode failed during intervention rollout cleanup.")
+
+        if scn_success:
+            n_committed_list = env.call("commit_pending_episodes")
+            n_committed = int(sum(n_committed_list)) if n_committed_list else 0
+        else:
+            env.call("discard_pending_episodes")
+            n_committed = 0
+        intervention_ctx.n_committed_episodes += n_committed
+
+        ctrl = intervention_ctx.controller
+        logging.info(
+            "Scenario %d finished: success=%s cycles=%d status=%s (%d episode(s) %s)",
+            intervention_ctx.scenario_idx,
+            scn_success,
+            ctrl.cycles_used,
+            ctrl.last_status,
+            n_committed if scn_success else ctrl.cycles_used,
+            "committed" if scn_success else "discarded",
+        )
+        intervention_ctx.record_scenario_result(intervention_ctx.scenario_idx, scn_success)
+        # Advance the counter for the next rollout() call (next scenario).
+        intervention_ctx.scenario_idx += 1
+
     return ret
 
 
@@ -374,6 +491,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    intervention_ctx: "InterventionContext | None" = None,
 ) -> dict:
     """
     Args:
@@ -463,6 +581,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            intervention_ctx=intervention_ctx,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -689,6 +808,36 @@ def _compile_episode_data(
 def eval_main(cfg: EvalPipelineConfig):
     logging.info(pformat(asdict(cfg)))
 
+    # ── intervention-mode pre-flight validation ──────────────────────────── #
+    # When `cfg.intervention` is set, lerobot-eval switches into single-env
+    # per-scenario mode with an `InterventionController` driving an SA-wrapped
+    # policy. Several config combinations are incompatible with that mode and
+    # would fail downstream in confusing ways — error here instead.
+    if cfg.intervention is not None:
+        if cfg.eval.batch_size != 1:
+            raise ValueError(
+                f"Intervention mode requires --eval.batch_size=1, got {cfg.eval.batch_size}. "
+                "The controller's state machine ticks per-step on a single env."
+            )
+        if cfg.eval.use_async_envs:
+            raise ValueError(
+                "Intervention mode is incompatible with --eval.use_async_envs=true. "
+                "The controller needs synchronous access to env state each tick to decide "
+                "whether to cancel an active intervention."
+            )
+        sa_cfg_pre = getattr(cfg.policy, "shared_autonomy_config", None)
+        if sa_cfg_pre is None or not sa_cfg_pre.enabled:
+            raise ValueError(
+                "Intervention mode requires --policy.shared_autonomy_config.enabled=true. "
+                "Both 'rrt' and 'oracle_goal' guidance sources live on the SA wrapper; "
+                "without it there is no intervention path."
+            )
+        if not getattr(cfg.env, "teleop_dataset_repo_id", None):
+            raise ValueError(
+                "Intervention mode requires --env.teleop_dataset_repo_id=<repo>. "
+                "An intervention run without a recording target is wasted compute."
+            )
+
     # Check device is available
     if cfg.policy is not None:
         get_safe_torch_device(cfg.policy.device, log=True)
@@ -748,12 +897,51 @@ def eval_main(cfg: EvalPipelineConfig):
     else:
         _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
 
-    # DEBUG: outermost last-mile oracle override. Applied AFTER TE+SA so it
-    # overrides whatever final action the inner stack produces. Diagnostic
-    # only — remove once the last-mile-precision hypothesis test is done.
-    last_mile_cfg = getattr(cfg.policy, "last_mile_debug_config", None)
+    # Outermost last-mile help wrapper. Applied AFTER TE+SA so it overrides
+    # whatever final action the inner stack produces.
+    last_mile_cfg = getattr(cfg.policy, "last_mile_config", None)
     if last_mile_cfg is not None and last_mile_cfg.enabled:
-        policy = _wrap_with_last_mile_debug(policy, cfg.policy)
+        policy = _wrap_with_last_mile(policy, cfg.policy)
+
+    # ── intervention-mode setup ──────────────────────────────────────────── #
+    # If we got here with cfg.intervention set, the validation block at the
+    # top of eval_main already confirmed the SA wrapper is enabled and the
+    # env/eval flags are intervention-compatible. Now wire the controller +
+    # context + CSV and force the SA-wrapper flags the controller needs.
+    intervention_ctx = None
+    if cfg.intervention is not None:
+        from lerobot.policies.teleop_recording import TeleopRecordingContext
+        from lerobot.scripts.intervention_controller import (
+            InterventionContext,
+            InterventionController,
+        )
+
+        sa_policy = _find_shared_autonomy_wrapper(policy)
+        if sa_policy is None:
+            # Defensive — validation block above should make this unreachable.
+            raise RuntimeError("Intervention mode set but SA wrapper not found in the wrapper chain.")
+        # Headless: controller cannot tolerate pause-gate blocking.
+        sa_policy.auto_pause_on_rrt_finish = False
+        sa_policy._run_event.set()
+        # Hand the env handle to the SA wrapper so the RRT source can teleport
+        # the sim's joint state pre-execution. Walk the nested envs dict to
+        # pull the single VectorEnv (validation guaranteed exactly one task).
+        flat_envs = [vec for group in envs.values() for vec in group.values()]
+        if len(flat_envs) != 1:
+            raise ValueError(
+                f"Intervention mode expects exactly one task/env (single-env), found {len(flat_envs)}."
+            )
+        sa_policy.set_env_for_teleport(flat_envs[0])
+
+        ctrl = InterventionController(sa_policy, cfg.intervention)
+        intervention_ctx = InterventionContext(
+            controller=ctrl,
+            teleop_context=TeleopRecordingContext.get_instance(),
+            csv_path=Path(cfg.output_dir) / "intervention_per_scenario.csv",
+        )
+        intervention_ctx.open_csv()
+        logging.info("Intervention config: %s", pformat(asdict(cfg.intervention)))
+        logging.info("Per-scenario CSV: %s", intervention_ctx.csv_path)
 
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
@@ -774,6 +962,7 @@ def eval_main(cfg: EvalPipelineConfig):
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
             output_dir=Path(cfg.output_dir),
+            intervention_ctx=intervention_ctx,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -791,6 +980,15 @@ def eval_main(cfg: EvalPipelineConfig):
 
     with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
         json.dump(info, f, indent=2, default=_json_default)
+
+    # Finalize the per-scenario CSV (intervention mode only).
+    if intervention_ctx is not None:
+        intervention_ctx.close_csv()
+        logging.info(
+            "Intervention run complete: %d episode(s) committed to dataset across %d scenario(s).",
+            intervention_ctx.n_committed_episodes,
+            intervention_ctx.scenario_idx,
+        )
 
     # Close all vec envs (intentionally after saving eval_info.json so results
     # are persisted even if env cleanup has issues)
@@ -824,6 +1022,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    intervention_ctx: "InterventionContext | None" = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -841,6 +1040,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        intervention_ctx=intervention_ctx,
     )
 
     per_episode = task_result["per_episode"]
@@ -887,6 +1087,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    intervention_ctx: "InterventionContext | None" = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -911,6 +1112,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        intervention_ctx=intervention_ctx,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -934,6 +1136,7 @@ def eval_policy_all(
     max_parallel_tasks: int = 1,
     output_dir: Path | None = None,
     close_envs_after_eval: bool = True,
+    intervention_ctx: "InterventionContext | None" = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -1019,6 +1222,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        intervention_ctx=intervention_ctx,
     )
 
     if max_parallel_tasks <= 1:

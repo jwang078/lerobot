@@ -19,6 +19,7 @@ from pathlib import Path
 
 from lerobot import envs, policies  # noqa: F401
 from lerobot.configs import parser
+from lerobot.configs.intervention import InterventionConfig
 
 from .default import EvalConfig
 from .policies import PreTrainedConfig
@@ -41,6 +42,13 @@ class EvalPipelineConfig:
     rename_map: dict[str, str] = field(default_factory=dict)
     # Explicit consent to execute remote code from the Hub (required for hub environments).
     trust_remote_code: bool = False
+    # Optional intervention-driven rollout config. None (default) → passive
+    # eval / keyboard-teleop recording (existing behavior). Set →
+    # lerobot-eval switches into single-env per-scenario intervention mode
+    # with an `InterventionController` driving an SA-wrapped policy. See
+    # `lerobot.scripts.intervention_controller` for the state machine and
+    # `my_scripts/dagger_orchestrate.sh` for the DAgger use case.
+    intervention: InterventionConfig | None = None
 
     def __post_init__(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
