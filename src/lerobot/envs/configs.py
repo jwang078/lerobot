@@ -553,16 +553,22 @@ class SplatSimEnv(EnvConfig):
     # Required for the shared autonomy wrapper's "RRT to Goal" mode.
     include_oracle_info: bool = False
 
-    # When True (default), the wrist camera renders with the GoPro fisheye
-    # calibration. When False, it renders as pinhole using base camera intrinsics.
-    # Use False to A/B test the fisheye visual covariate shift or to reproduce
-    # pre-fisheye datasets.
-    use_fisheye_wrist_camera: bool = True
+    # Wrist camera model version (see WRIST_CAM_FISHEYE_CALIBRATIONS in
+    # splatsim/robots/sim_robot_pybullet_base.py):
+    #   0 = pinhole using base camera intrinsics (matches pre-fisheye datasets)
+    #   1 = fisheye, original 2704x2028 GoPro calibration (default)
+    #   2 = fisheye, recalibrated 1920x1080 GoPro calibration
+    wrist_cam_ver: int = 1
 
     # Teleop recording: save pure-teleop (ratio=0) segments to a LeRobot dataset.
     # Set to a repo ID (e.g. "user/teleop-data") to enable; None to disable.
     teleop_dataset_repo_id: str | None = None
     teleop_min_episode_length: int = 60  # discard segments shorter than this
+    # When True (default, backward-compat), TeleopRecordingWrapper.close() pushes
+    # the finalized dataset to HuggingFace Hub. Set False to keep the dataset
+    # local-only (used by dagger_orchestrate.sh's offline mode to avoid round-
+    # tripping each round's intervention dataset through the Hub).
+    teleop_push_to_hub: bool = True
 
     # Image dimensions
     observation_height: int = 224
@@ -628,7 +634,7 @@ class SplatSimEnv(EnvConfig):
             "debug_mode": self.debug_mode,
             "image_resize_modes": server_image_resize_modes,
             "port": self.port,
-            "use_fisheye_wrist_camera": self.use_fisheye_wrist_camera,
+            "wrist_cam_ver": self.wrist_cam_ver,
         }
         # Include task_description if provided (for language-conditioned policies)
         if self.task_description is not None:
@@ -675,6 +681,7 @@ class SplatSimEnv(EnvConfig):
         task = self.task
         episode_length = self.episode_length
         teleop_min_episode_length = self.teleop_min_episode_length
+        teleop_push_to_hub = self.teleop_push_to_hub
 
         def _wrap_for_recording(env):
             """Apply TeleopRecordingWrapper when teleop recording is configured."""
@@ -691,6 +698,7 @@ class SplatSimEnv(EnvConfig):
                     image_keys=image_keys,
                     task=task,
                     min_episode_length=teleop_min_episode_length,
+                    push_to_hub=teleop_push_to_hub,
                 )
             return env
 
