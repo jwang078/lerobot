@@ -65,6 +65,41 @@ class SharedAutonomyConfig:
     # Should match the env's fps. Only consulted when the GUI's "RRT to Goal" button
     # is pressed, so a slightly off value just changes the trajectory pacing.
     fps: int = 30
+    # Number of past steps to keep in a ring buffer of actual joint observations.
+    # When RRT is triggered, the wrapper plans from the oldest entry in this
+    # buffer (== ~N steps before trigger), then teleports the sim to that pose
+    # so the recorded intervention trajectory begins at a clean, pre-jump state
+    # with no "sim catching up" frames. Larger N rewinds further; too large and
+    # the rewound pose may pre-date a relevant scene change (e.g. an object
+    # the policy already pushed). 3-5 is a good default.
+    rrt_pre_jump_lookback_steps: int = 5
+    # When True, the wrapper teleports the env's robot to the pre-jump pose
+    # before starting RRT execution (sim-only). Set to False for real-robot
+    # runs where teleportation isn't possible.
+    rrt_teleport_to_q_start: bool = True
+    # When True (default), trigger_rrt_to_goal blocks until planning +
+    # teleport finish and the wrapper is in EXECUTING. The env is never
+    # stepped while the planner is working, so the recorded intervention
+    # data begins on the very first RRT action — no frames of "policy still
+    # driving the robot toward the collision while the planner thinks".
+    # Set False only when you're driving the wrapper from a GUI thread that
+    # can't afford to block (e.g. an interactive teleop control surface).
+    rrt_blocking_plan: bool = True
+    # How the planner picks among IK-goal-candidate paths. One of:
+    #   * "ee_arc_length" (default) — minimize cartesian EE distance traversed.
+    #     Penalizes wide swings; current behavior.
+    #   * "joint_arc_length" — minimize joint-space L2 distance summed across
+    #     waypoints. Legacy behavior; tends to pick paths that land near
+    #     q_start in configuration space even if the EE swings wide.
+    #   * "joint_velocity_match" — minimize L2 deviation between the
+    #     candidate's initial joint velocity and the robot's recent joint
+    #     velocity (averaged over the trailing samples of
+    #     `_actual_q_history`). Picks the path that maintains the robot's
+    #     current motion direction the most, minimizing the velocity
+    #     discontinuity at the trigger moment. Requires enough history to
+    #     derive a velocity (≥2 samples); raises if not.
+    # None passes through to the planner's default (EE_ARC_LENGTH).
+    rrt_path_selection: str | None = None
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.forward_flow_ratio <= 1.0:
