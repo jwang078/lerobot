@@ -355,12 +355,21 @@ def rollout(
         if intervention_ctx is not None:
             from lerobot.scripts.intervention_controller import (
                 _extract_in_collision,
+                _extract_orientation_error_deg,
+                _extract_position_error_m,
                 _extract_success,
             )
 
             scn_success = _extract_success(info)
             in_collision = _extract_in_collision(info)
-            decision = intervention_ctx.controller.tick(success=scn_success, in_collision=in_collision)
+            position_error_m = _extract_position_error_m(info)
+            orientation_error_deg = _extract_orientation_error_deg(info)
+            decision = intervention_ctx.controller.tick(
+                success=scn_success,
+                in_collision=in_collision,
+                position_error_m=position_error_m,
+                orientation_error_deg=orientation_error_deg,
+            )
             if decision == "advance":
                 done = np.ones_like(done, dtype=bool)
 

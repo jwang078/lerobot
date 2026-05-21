@@ -61,6 +61,46 @@ class InterventionConfig:
     # rrt_steps_min/max picks a target inside this chunk; choosing
     # target < chunk_steps means partial playback before cancel.
     oracle_goal_chunk_steps: int = 80
+    # No-progress trigger (in addition to the step-count stall + collision
+    # triggers). Fires when the env's `info["position_error_m"]` — distance
+    # from the EE to the goal pose — hasn't improved by at least
+    # `no_progress_min_decrease_m` for `no_progress_window_steps` consecutive
+    # policy steps. Catches the "policy is drifting confidently in the wrong
+    # direction" failure mode much earlier than the time-based stall trigger.
+    #
+    # Internally uses the same anchor-based algorithm as the last_mile
+    # wrapper's NoEEProgressDetector (shared via
+    # lerobot.policies.last_mile.detectors.EEDistanceProgressTracker), so
+    # tuning the params here uses the same semantics: anchor moves down with
+    # the EE on progress, resets if the robot enters a repositioning epoch.
+    #
+    # Disabled by default (window=0). Recommended starting values when
+    # enabling: window=50, min_decrease=0.005m, warmup=30. Set
+    # `no_progress_warmup_steps` higher (e.g. 100) if the policy needs time
+    # to start moving from rest.
+    #
+    # Silently no-ops if the env doesn't surface `position_error_m` in info.
+    no_progress_window_steps: int = 0
+    no_progress_min_decrease_m: float = 0.005
+    no_progress_warmup_steps: int = 30
+    no_progress_reposition_grace_steps: int = 30
+    no_progress_reposition_turnaround_m: float = 0.01
+
+    # Orientation-axis no-progress trigger. Mirrors the position trigger but
+    # watches `info["orientation_error_deg"]` instead. Catches the
+    # "wrist twisting wrong" failure mode that position-only triggers miss
+    # — e.g., a policy that gets to the right position but can't align the
+    # gripper for a precision grasp. Both triggers can be enabled together
+    # (independent state, OR'd into the same intervention fire).
+    #
+    # Disabled by default (window=0). Recommended starting values when
+    # enabling: window=50, min_decrease=1.0deg, warmup=30. Silently no-ops
+    # if the env doesn't surface `orientation_error_deg` in info.
+    no_progress_orientation_window_steps: int = 0
+    no_progress_orientation_min_decrease_deg: float = 1.0
+    no_progress_orientation_warmup_steps: int = 30
+    no_progress_orientation_reposition_grace_steps: int = 30
+    no_progress_orientation_reposition_turnaround_deg: float = 2.0
     # Hard cap on intervention cycles per scenario. Advance once hit.
     max_cycles_per_scenario: int = 10
     # Only meaningful for method == "rrt" (oracle_goal interpolation never
