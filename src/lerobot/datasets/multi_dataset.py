@@ -118,6 +118,23 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         return {repo_id: i for i, repo_id in enumerate(self.repo_ids)}
 
     @property
+    def cumulative_sizes(self) -> list[int]:
+        """Sub-dataset boundary offsets, matching `torch.utils.data.ConcatDataset.cumulative_sizes`.
+
+        `cumulative_sizes[i]` is the number of frames in datasets 0..i (inclusive),
+        so `cumulative_sizes[-1] == len(self)` and `range(cumulative_sizes[i-1], cumulative_sizes[i])`
+        is the index range belonging to sub-dataset i. Used by external callers
+        (weighted samplers, per-source normalizing wrappers) that need to map a
+        flat MultiLeRobotDataset index back to its source sub-dataset.
+        """
+        sizes = []
+        running = 0
+        for ds in self._datasets:
+            running += ds.num_frames
+            sizes.append(running)
+        return sizes
+
+    @property
     def fps(self) -> int:
         """Frames per second used during data collection.
 

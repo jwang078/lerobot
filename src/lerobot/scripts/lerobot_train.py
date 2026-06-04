@@ -302,6 +302,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Apply rename_map to dataset stats keys so the normalizer can find them after the rename step.
     # The rename step runs before normalization, so stats must be keyed by the post-rename names.
     # e.g. "observation.images.base_rgb_letterbox" -> "observation.images.base_rgb"
+    #
+    # In multi-dataset weighted-sampling mode, `dataset.meta.stats` is the
+    # AGGREGATED stats computed by `MultiSourceNormalizingDataset` over all
+    # sub-datasets' sidecars (min-of-mins, max-of-maxes, count-weighted
+    # mean/std, etc.). The policy's normalize layer is fed those aggregated
+    # stats and normalizes every frame ONCE. No special case needed here —
+    # single-dataset and multi-dataset modes both flow through this same path.
     renamed_stats = {cfg.rename_map.get(k, k): v for k, v in dataset.meta.stats.items()}
 
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
@@ -414,12 +421,43 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    # Multi-dataset weighted sampling: when `sample_weights` is set, build a
+    # WeightedRandomSampler so per-source share is governed by the configured
+    # target weights instead of by the dataset-size ratio (which is what
+    # `shuffle=True` over a ConcatDataset would give you). Each frame in
+    # sub-dataset i gets per-sample weight `sample_weights[i] / size_i`, so the
+    # expected per-batch share matches `sample_weights[i]` exactly.
+    # `replacement=True` is required for float weights and is correct semantics:
+    # "every batch is X% intervention" is meaningful regardless of how few
+    # intervention frames exist on disk.
+    sampler = None
+    shuffle_arg = not cfg.dataset.streaming
+    if cfg.dataset.sample_weights is not None:
+        per_sample_weights = torch.zeros(len(dataset), dtype=torch.double)
+        cumulative_sizes = dataset.cumulative_sizes
+        starts = [0, *cumulative_sizes[:-1]]
+        for i, (start, end) in enumerate(zip(starts, cumulative_sizes, strict=True)):
+            per_sample_weights[start:end] = cfg.dataset.sample_weights[i] / (end - start)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=per_sample_weights,
+            num_samples=len(dataset),
+            replacement=True,
+        )
+        shuffle_arg = False  # DataLoader gates on sampler XOR shuffle
+        if is_main_process:
+            logging.info(
+                "Multi-dataset weighted sampling enabled: per-source weights=%s, sub-dataset sizes=%s",
+                cfg.dataset.sample_weights,
+                [end - start for start, end in zip(starts, cumulative_sizes, strict=True)],
+            )
+
     # create dataloader for offline training
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
         batch_size=cfg.batch_size,
-        shuffle=not cfg.dataset.streaming,
+        shuffle=shuffle_arg,
+        sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,

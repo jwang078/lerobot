@@ -41,6 +41,24 @@ class DatasetConfig:
     # for relative action stats, without needing to store the dataset twice.
     stats_path: str | None = None
 
+    # ─── Multi-dataset weighted-sampling mode ─────────────────────────────────
+    # When `repo_ids` is set, training switches to multi-dataset mode:
+    #   * `repo_id` must be empty (mutually exclusive with `repo_ids`).
+    #   * Each entry of `repo_ids` is loaded as its own LeRobotDataset and
+    #     concatenated via MultiLeRobotDataset.
+    #   * `sample_weights` controls per-source sampling probability — frames
+    #     from sub-dataset i are drawn with target share `sample_weights[i]`
+    #     regardless of how large sub-dataset i is. Must be the same length
+    #     as `repo_ids` and sum to ~1.0.
+    #   * `stats_paths` parallels `repo_ids`; each frame is normalized using
+    #     its source dataset's stats sidecar via MultiSourceNormalizingDataset
+    #     so the policy's normalize layer is a no-op in this mode.
+    # In single-dataset mode (the default — `repo_ids` is None), these fields
+    # are ignored entirely and behavior is byte-identical to today.
+    repo_ids: list[str] | None = None
+    sample_weights: list[float] | None = None
+    stats_paths: list[str] | None = None
+
     def __post_init__(self) -> None:
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):

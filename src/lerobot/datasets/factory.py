@@ -78,7 +78,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
 
-    if isinstance(cfg.dataset.repo_id, str):
+    if cfg.dataset.repo_ids is None:
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
@@ -106,17 +106,50 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 tolerance_s=cfg.tolerance_s,
             )
     else:
-        raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
-        dataset = MultiLeRobotDataset(
-            cfg.dataset.repo_id,
-            # TODO(aliberts): add proper support for multi dataset
-            # delta_timestamps=delta_timestamps,
+        # Multi-dataset weighted-sampling mode (see DatasetConfig docstring
+        # for the activation surface). Build the per-sub-dataset metadata
+        # using the FIRST sub-dataset's metadata as the reference for
+        # delta_timestamps resolution — all sub-datasets share the same
+        # robot/task schema by construction (TrainPipelineConfig.validate
+        # enforces parallel `stats_paths` so they're compatible).
+        #
+        # These asserts are guaranteed by TrainPipelineConfig.validate, which
+        # ran before make_dataset is reached — pyright can't see across that
+        # validation boundary, so we re-assert here for type-narrowing AND
+        # defense-in-depth in case make_dataset is called directly.
+        assert cfg.dataset.repo_ids is not None, "validate() should have set repo_ids before make_dataset"
+        assert cfg.dataset.stats_paths is not None, "validate() requires stats_paths when repo_ids is set"
+        assert cfg.policy is not None, "make_dataset requires cfg.policy"
+        ds_meta = LeRobotDatasetMetadata(
+            cfg.dataset.repo_ids[0], root=cfg.dataset.root, revision=cfg.dataset.revision
+        )
+        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        multi = MultiLeRobotDataset(
+            repo_ids=cfg.dataset.repo_ids,
+            root=cfg.dataset.root,
+            delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             video_backend=cfg.dataset.video_backend,
         )
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
-            f"{pformat(dataset.repo_id_to_index, indent=2)}"
+            f"{pformat(multi.repo_id_to_index, indent=2)}"
+        )
+        # Wrap MultiLeRobotDataset in MultiSourceNormalizingDataset so each
+        # frame is normalized with its source dataset's stats sidecar before
+        # leaving the dataloader. The policy's downstream NormalizerProcessorStep
+        # is set to a no-op in lerobot_train.py for this mode.
+        # Import here (not at top) to avoid a circular import with factory.py
+        # callers that don't use multi mode.
+        from lerobot.datasets.multi_source_normalizing_dataset import (
+            MultiSourceNormalizingDataset,
+        )
+
+        dataset = MultiSourceNormalizingDataset(
+            multi_dataset=multi,
+            stats_paths=cfg.dataset.stats_paths,
+            features={**cfg.policy.input_features, **cfg.policy.output_features},
+            norm_map=cfg.policy.normalization_mapping,
         )
 
     if cfg.dataset.use_imagenet_stats:

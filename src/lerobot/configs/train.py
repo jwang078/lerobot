@@ -129,8 +129,56 @@ class TrainPipelineConfig(HubMixin):
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/train") / train_dir
 
-        if isinstance(self.dataset.repo_id, list):
-            raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+        # ─── Multi-dataset weighted-sampling validation ───────────────────────
+        # Two modes:
+        #   (1) Single-dataset (default): `dataset.repo_id` is set, all
+        #       multi-dataset fields are None. Byte-identical to legacy behavior.
+        #   (2) Multi-dataset: `dataset.repo_ids` is set, `dataset.sample_weights`
+        #       and `dataset.stats_paths` are parallel-length lists; `repo_id`
+        #       must be empty. Sample weights must sum to ~1.0 (±epsilon).
+        # Anything in between is a config bug — fail fast with a clear message.
+        if self.dataset.repo_ids is not None:
+            if self.dataset.repo_id:
+                raise ValueError(
+                    "Set EITHER `dataset.repo_id` (single-dataset mode) OR "
+                    "`dataset.repo_ids` (multi-dataset weighted-sampling mode), "
+                    f"not both. Got repo_id={self.dataset.repo_id!r} AND "
+                    f"repo_ids={self.dataset.repo_ids!r}."
+                )
+            if not isinstance(self.dataset.repo_ids, list) or len(self.dataset.repo_ids) == 0:
+                raise ValueError(
+                    "`dataset.repo_ids` must be a non-empty list of dataset repo ids "
+                    f"in multi-dataset mode. Got {self.dataset.repo_ids!r}."
+                )
+            n = len(self.dataset.repo_ids)
+            if self.dataset.sample_weights is None or len(self.dataset.sample_weights) != n:
+                raise ValueError(
+                    f"`dataset.sample_weights` must be a list of {n} floats parallel to "
+                    f"`dataset.repo_ids`. Got {self.dataset.sample_weights!r}."
+                )
+            weight_sum = sum(self.dataset.sample_weights)
+            if not (0.999 <= weight_sum <= 1.001):
+                raise ValueError(
+                    f"`dataset.sample_weights` must sum to 1.0 (±0.001). "
+                    f"Got sum={weight_sum:.6f} from {self.dataset.sample_weights!r}."
+                )
+            if any(w < 0 for w in self.dataset.sample_weights):
+                raise ValueError(
+                    f"All `dataset.sample_weights` must be non-negative. Got {self.dataset.sample_weights!r}."
+                )
+            if self.dataset.stats_paths is None or len(self.dataset.stats_paths) != n:
+                raise ValueError(
+                    f"`dataset.stats_paths` must be a list of {n} stats sidecar paths "
+                    f"parallel to `dataset.repo_ids`. Per-source normalization needs "
+                    f"every sub-dataset's stats. Got {self.dataset.stats_paths!r}."
+                )
+        elif not self.dataset.repo_id:
+            raise ValueError(
+                "Either `dataset.repo_id` (single-dataset) or `dataset.repo_ids` "
+                "(multi-dataset weighted sampling) must be set."
+            )
+        # If `repo_ids` is None and `repo_id` is set, validation passes and the
+        # single-dataset code path runs unchanged below.
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
