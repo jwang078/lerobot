@@ -548,6 +548,14 @@ class SplatSimEnv(EnvConfig):
     external_port: int | None = None
     external_host: str = "127.0.0.1"
 
+    # When True, the in-process PybulletRobotServerBase connects via p.DIRECT
+    # instead of p.GUI — no pybullet visualizer window. Has no effect when
+    # `external_port` is set, since that path uses ZMQSplatSimGymEnv (no local
+    # pybullet client) and the external sim's GUI mode is controlled by ITS
+    # own --headless flag at launch (see SplatSim's scripts/launch_nodes.py).
+    # Wired by `dagger_orchestrate.sh --headless` for fast batch runs.
+    headless: bool = False
+
     # When True, the gym env exposes get_env_config() so the policy / wrapper can
     # access obstacle geometry and the task goal (q_goal_bias, target_ee_pos/quat).
     # Required for the shared autonomy wrapper's "RRT to Goal" mode.
@@ -732,6 +740,11 @@ class SplatSimEnv(EnvConfig):
             from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
 
             splatsim_cfg = self.gym_kwargs.get("cfg", {})
+            # Inject the SplatSimEnv.headless field so the in-process
+            # PybulletRobotServerBase connects via p.DIRECT instead of p.GUI.
+            # No-op when headless is False (the default) — robot server's
+            # ctor default leaves GUI mode on.
+            splatsim_cfg = {**splatsim_cfg, "headless": self.headless}
             splatsim_serve_mode = (
                 PybulletRobotServerBase.SERVE_MODES.EVAL_BENCHMARK
                 if self.eval_benchmark_repo_id is not None
