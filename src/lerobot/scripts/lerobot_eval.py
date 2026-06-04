@@ -415,7 +415,14 @@ def rollout(
         running_success_rate = (
             einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
         )
-        progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
+        # refresh=False — let progbar.update() trigger the single refresh,
+        # otherwise each loop iteration writes the bar twice. Invisible on a
+        # real TTY (both `\r`-overwrite the same line) but doubles the line
+        # count when stdout isn't TTY-detected by tqdm (e.g. when piped/tee'd).
+        progbar.set_postfix(
+            {"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"},
+            refresh=False,
+        )
         progbar.update()
 
     # Track the final observation.
@@ -698,8 +705,13 @@ def eval_policy(
                 threads.append(thread)
                 n_episodes_rendered += 1
 
+        # refresh=False: see the matching comment on the inner-rollout
+        # progbar.set_postfix call. The outer for-loop already triggers a
+        # tqdm refresh on the next iteration; this just stages the postfix
+        # for that refresh without double-writing.
         progbar.set_postfix(
-            {"running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"}
+            {"running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"},
+            refresh=False,
         )
 
     # Wait till all video rendering threads are done.
