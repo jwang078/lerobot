@@ -312,6 +312,9 @@ ignore = [
 # E402: conditional-import guards (TYPE_CHECKING / is_package_available) must precede the imports they protect
 "src/lerobot/scripts/convert_dataset_v21_to_v30.py" = ["E402"]
 "src/lerobot/policies/wall_x/**" = ["N801", "N812", "SIM102", "SIM108", "SIM210", "SIM211", "B006", "B007", "SIM118"] # Supprese these as they are coming from original Qwen2_5_vl code TODO(pepijn): refactor original
+# my_scripts: personal scratch/experimentation area. Math-y code uses numpy-style
+# capital-letter dim names (H/W/N/L/D), keeping N803/N806/F841 enforcement isn't worth it.
+"my_scripts/**" = ["N803", "N806", "F841", "SIM102", "SIM108"]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
