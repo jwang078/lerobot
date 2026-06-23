@@ -109,6 +109,14 @@ class DiffusionConfig(PreTrainedConfig):
     # Relative actions (action -= state for non-excluded joints)
     use_relative_actions: bool = False
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Populated by `make_policy` from `ds_meta.features["action"]["names"]` so
+    # `RelativeActionsProcessorStep._build_mask` can resolve `relative_exclude_joints`
+    # to per-dim mask indices. Without this field the make_policy step is skipped
+    # (via its `hasattr(cfg, "action_feature_names")` check), `action_names` stays
+    # None, and `_build_mask` silently falls back to all-True — gripper gets
+    # converted to relative and the post-recording action contains the gripper
+    # state instead of the commanded zero. Matches PI0 / PI0.5 / PI0FAST configs.
+    action_feature_names: list[str] | None = None
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {

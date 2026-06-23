@@ -144,6 +144,15 @@ class TeleopRecordingContext:
         # behavior, used by interactive teleop where there is no upstream
         # decision to defer to.
         self.defer_episode_saves: bool = False
+        # When > 0, the next _flush_buffer call drops this many ADDITIONAL
+        # frames from the start of the RRT segment, AFTER the standard
+        # leading-trim removes has_guidance=False frames. Set by the
+        # intervention controller when it triggers RRT from a rest-start
+        # trigger (e.g. "time stall") to drop the n_obs_steps - 1 velocity-
+        # artifact frames at the segment onset where the robot is
+        # accelerating from a stopped state. Auto-consumed (reset to 0) by
+        # _flush_buffer so it only affects one segment per set.
+        self.rrt_extra_leading_trim: int = 0
 
     @classmethod
     def get_instance(cls) -> TeleopRecordingContext:
@@ -276,32 +285,63 @@ class TeleopRecordingWrapper(gym.Wrapper):
         else:
             self._dataset.add_frame(frame)
 
-    def _trim_frames(self, frames: list[tuple[dict, bool]]) -> list[tuple[dict, bool]]:
-        """Trim leading and trailing no-guidance frames from the buffer."""
+    def _trim_frames(
+        self,
+        frames: list[tuple[dict, bool]],
+        *,
+        extra_leading: int = 0,
+    ) -> tuple[list[tuple[dict, bool]], int, int, int]:
+        """Trim leading and trailing no-guidance frames from the buffer.
+
+        Returns ``(kept_frames, n_leading_trimmed, n_trailing_trimmed,
+        n_onset_trimmed)``. ``n_onset_trimmed`` reports how many of the
+        ``extra_leading`` request were actually dropped (capped by what
+        remained after the standard leading-trim).
+        """
         if not frames:
-            return frames
+            return frames, 0, 0, 0
 
         # 1. Trim trailing no-guidance frames
         end = len(frames)
         while end > 0 and not frames[end - 1][1]:
             end -= 1
+        n_trailing = len(frames) - end
         if end == 0:
-            return []
+            return [], 0, n_trailing, 0
 
         # 2. Trim leading no-guidance frames
         start = 0
         while start < end and not frames[start][1]:
             start += 1
+        n_leading = start
         if start >= end:
-            return []
+            return [], n_leading, n_trailing, 0
 
-        return frames[start:end]
+        # 3. Drop the first ``extra_leading`` real frames to suppress
+        # velocity-from-rest artifacts at RRT segment onset (e.g. when
+        # the trigger reason rewinds via lookback + ruckig start_vel=0).
+        n_onset = 0
+        if extra_leading > 0:
+            n_onset = min(end - start, extra_leading)
+            start += n_onset
+
+        if start >= end:
+            return [], n_leading, n_trailing, n_onset
+
+        return frames[start:end], n_leading, n_trailing, n_onset
 
     def _flush_buffer(self) -> None:
         """Trim the teleop buffer and commit survivors to the dataset."""
         if not self._frame_buffer:
             return
-        trimmed = self._trim_frames(self._frame_buffer)
+        # Consume the per-segment onset-trim budget set by the intervention
+        # controller (reset regardless of buffer state so a leftover value
+        # can't bleed into the next segment).
+        extra_leading = self._context.rrt_extra_leading_trim
+        self._context.rrt_extra_leading_trim = 0
+        trimmed, n_leading, n_trailing, n_onset = self._trim_frames(
+            self._frame_buffer, extra_leading=extra_leading
+        )
         # Snapshot the last surviving frame BEFORE add_frame mutates it
         # (LeRobotDataset.add_frame pops "task" for separate handling, so
         # post-call the dict is missing fields required by validate_frame).
@@ -310,10 +350,23 @@ class TeleopRecordingWrapper(gym.Wrapper):
         last_frame_snapshot = dict(trimmed[-1][0]) if trimmed else None
         for frame, _ in trimmed:
             self._emit_frame(frame)
-        n_trimmed = len(self._frame_buffer) - len(trimmed)
+        n_trimmed = n_leading + n_trailing + n_onset
         if n_trimmed > 0:
             logger.info(
-                f"[TeleopRecording] Trimmed {n_trimmed} frames ({len(self._frame_buffer)} -> {len(trimmed)})"
+                "[TeleopRecording] Trimmed %d frames (buffer %d → kept %d): "
+                "leading=%d (pre-RRT-trigger policy + planning frames, "
+                "has_guidance=False), trailing=%d (post-chunk policy frames "
+                "before _finish_episode fires, has_guidance=False — usually "
+                "0 since auto-cancel calls _finish_episode immediately), "
+                "onset=%d (velocity-from-rest artifact frames dropped at "
+                "RRT segment start; set by the controller when the trigger "
+                "rewinds via lookback)",
+                n_trimmed,
+                len(self._frame_buffer),
+                len(trimmed),
+                n_leading,
+                n_trailing,
+                n_onset,
             )
         self._committed_frame_count += len(trimmed)
         if last_frame_snapshot is not None:

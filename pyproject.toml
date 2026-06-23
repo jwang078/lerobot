@@ -314,7 +314,12 @@ ignore = [
 "src/lerobot/policies/wall_x/**" = ["N801", "N812", "SIM102", "SIM108", "SIM210", "SIM211", "B006", "B007", "SIM118"] # Supprese these as they are coming from original Qwen2_5_vl code TODO(pepijn): refactor original
 # my_scripts: personal scratch/experimentation area. Math-y code uses numpy-style
 # capital-letter dim names (H/W/N/L/D), keeping N803/N806/F841 enforcement isn't worth it.
-"my_scripts/**" = ["N803", "N806", "F841", "SIM102", "SIM108"]
+# Stylistic extras (E741/E731/B023/B904/B905/C408/SIM115) silenced for the same reason —
+# this directory is scratch space, not a polished library.
+"my_scripts/**" = [
+    "N803", "N806", "F841", "SIM102", "SIM108",
+    "E741", "E731", "B023", "B904", "B905", "B012", "C408", "SIM105", "SIM115",
+]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
@@ -334,6 +339,7 @@ docstring-code-format = true
 exclude_dirs = [
     "tests",
     "benchmarks",
+    "my_scripts",
     "src/lerobot/datasets/push_dataset_to_hub",
 ]
 skips = ["B101", "B311", "B404", "B603", "B615"]
@@ -347,10 +353,13 @@ default.extend-ignore-identifiers-re = [
     # Add individual words here to ignore them
     "2nd",
     "pn",
+    "PN",       # avoids false positive on PNG / PNGs in docstrings
+    "PNGs",
     "ser",
     "ein",
     "thw",
     "inpt",
+    "overlayed",  # valid US-English alternative of "overlaid"
     "ROBOTIS",
     "OT_VALUE"
 ]

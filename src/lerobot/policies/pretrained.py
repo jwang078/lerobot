@@ -204,6 +204,27 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         """
         raise NotImplementedError
 
+    def get_pending_action_chunk(self) -> Tensor | None:
+        """Peek at the cached, not-yet-executed action chunk that backs select_action.
+
+        For action-chunking policies (Diffusion, Pi0, Pi0.5, Pi0Fast) this returns
+        the actions still queued from the most recent forward pass — the ones that
+        will be popped by subsequent select_action calls. Peek is non-destructive
+        (does NOT pop) and runs without invoking the model.
+
+        Use case: the SharedAutonomyPolicyWrapper's future-chunk collision shield
+        needs to FK-check the actions the policy is COMMITTED to executing. Calling
+        ``predict_action_chunk`` separately would (a) be expensive (extra forward
+        pass) and (b) for stochastic policies (Diffusion) produce a DIFFERENT chunk
+        than the one actually executing — defeating the safety check.
+
+        Returns:
+            Normalized tensor of shape ``(n_remaining_steps, batch_size, action_dim)``,
+            or ``None`` if no chunk is cached yet (before first select_action, after
+            reset, or for policies without action chunking).
+        """
+        return None
+
     def push_model_to_hub(
         self,
         cfg: TrainPipelineConfig,

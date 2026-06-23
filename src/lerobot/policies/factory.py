@@ -722,10 +722,22 @@ def _wrap_with_shared_autonomy(policy, cfg):
         blend_mode=sa_cfg.blend_mode,
         n_anchor_steps=sa_cfg.n_anchor_steps,
         fps=sa_cfg.fps,
-        rrt_pre_jump_lookback_steps=sa_cfg.rrt_pre_jump_lookback_steps,
+        rrt_collision_detection=sa_cfg.rrt_collision_detection,
+        rrt_pre_jump_lookback=sa_cfg.pre_jump_lookback,
+        rrt_future_chunk=sa_cfg.future_chunk,
         rrt_teleport_to_q_start=sa_cfg.rrt_teleport_to_q_start,
         rrt_blocking_plan=sa_cfg.rrt_blocking_plan,
         rrt_path_selection=sa_cfg.rrt_path_selection,
+        rrt_segment_at_sharp_corners=sa_cfg.rrt_segment_at_sharp_corners,
+        rrt_ik_goal_selection=sa_cfg.rrt_ik_goal_selection,
+        rrt_num_path_candidates_per_ik=sa_cfg.rrt_num_path_candidates_per_ik,
+        rrt_max_path_attempts_per_ik=sa_cfg.rrt_max_path_attempts_per_ik,
+        rrt_path_perturbation_scale=sa_cfg.rrt_path_perturbation_scale,
+        rrt_num_ik_candidates=sa_cfg.rrt_num_ik_candidates,
+        rrt_obstacle_clearance=sa_cfg.rrt_obstacle_clearance,
+        rrt_self_collision_clearance=sa_cfg.rrt_self_collision_clearance,
+        rrt_self_collision_skip_pairs=sa_cfg.rrt_self_collision_skip_pairs,
+        rrt_diagnostic_log_pairs=sa_cfg.rrt_diagnostic_log_pairs,
     )
 
     # Connect shared context for teleop recording (if active)

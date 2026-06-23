@@ -50,14 +50,35 @@ class DatasetConfig:
     #     from sub-dataset i are drawn with target share `sample_weights[i]`
     #     regardless of how large sub-dataset i is. Must be the same length
     #     as `repo_ids` and sum to ~1.0.
-    #   * `stats_paths` parallels `repo_ids`; each frame is normalized using
-    #     its source dataset's stats sidecar via MultiSourceNormalizingDataset
-    #     so the policy's normalize layer is a no-op in this mode.
+    #   * `stats_paths` parallels `repo_ids`; how those stats are used at
+    #     normalization time depends on `norm_mode` below.
+    #   * `norm_mode` controls how the policy's normalizer + unnormalizer get
+    #     their stats out of the per-source sidecars:
+    #       - "aggregated" (default): min-of-mins / max-of-maxes / count-weighted
+    #         mean/std over ALL sources. One stats set, single normalization
+    #         pass, both train and eval use the same. The aggregated range
+    #         stretches every time intervention data adds extreme values, so
+    #         base data gets COMPRESSED into a narrower normalized range.
+    #       - "base_only": just use source[0]'s sidecar (the base dataset).
+    #         Intervention data normalized by base stats may fall outside
+    #         [-1, 1] if its raw range exceeds base's — the normalizer does
+    #         NOT clip, so the policy sees out-of-bounds normalized targets.
+    #         Useful for A/B testing whether aggregated-mode's base-compression
+    #         is hurting training; the trade-off is that you may instead hurt
+    #         training via the out-of-bounds intervention targets.
+    #       - "per_source": NOT IMPLEMENTED. Old design (pre-normalize each
+    #         frame using its source's stats, no-op the policy's normalizer)
+    #         was removed because the "no-op" trick was fragile across
+    #         `load_state_dict` (see `_stats_explicitly_provided` in
+    #         `lerobot.processor.normalize_processor`) and eval-time
+    #         normalization was inherently asymmetric (the live env has no
+    #         source attribution).
     # In single-dataset mode (the default — `repo_ids` is None), these fields
     # are ignored entirely and behavior is byte-identical to today.
     repo_ids: list[str] | None = None
     sample_weights: list[float] | None = None
     stats_paths: list[str] | None = None
+    norm_mode: str = "aggregated"
 
     def __post_init__(self) -> None:
         if self.episodes is not None:
@@ -68,6 +89,11 @@ class DatasetConfig:
             if len(self.episodes) != len(set(self.episodes)):
                 duplicates = sorted({ep for ep in self.episodes if self.episodes.count(ep) > 1})
                 raise ValueError(f"Episode indices contain duplicates: {duplicates}")
+        _allowed_norm_modes = {"aggregated", "base_only", "per_source"}
+        if self.norm_mode not in _allowed_norm_modes:
+            raise ValueError(
+                f"norm_mode must be one of {sorted(_allowed_norm_modes)}, got '{self.norm_mode}'"
+            )
 
 
 @dataclass

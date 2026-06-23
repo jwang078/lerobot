@@ -561,6 +561,19 @@ class SplatSimEnv(EnvConfig):
     # Required for the shared autonomy wrapper's "RRT to Goal" mode.
     include_oracle_info: bool = False
 
+    # When True, end the episode the first step `info["in_collision"]` is
+    # true. SplatSim's underlying env already publishes `in_collision` in
+    # the info dict on every step (it's the same predicate used by the
+    # intervention controller's collision trigger), so this wrapper just
+    # forces gymnasium's `terminated=True` based on that. Default False
+    # preserves historical behavior (episodes run until success / truncate
+    # / out-of-bounds). Use case: cleaner eval metrics ("success rate AT
+    # FIRST COLLISION" vs "success rate within episode_length steps")
+    # without changing intervention recording semantics — intervention
+    # recording leaves this False so the collision trigger handles it,
+    # while training-time eval can set it True.
+    terminate_on_collision: bool = False
+
     # Wrist camera model version (see WRIST_CAM_FISHEYE_CALIBRATIONS in
     # splatsim/robots/sim_robot_pybullet_base.py):
     #   0 = pinhole using base camera intrinsics (matches pre-fisheye datasets)
@@ -690,6 +703,30 @@ class SplatSimEnv(EnvConfig):
         episode_length = self.episode_length
         teleop_min_episode_length = self.teleop_min_episode_length
         teleop_push_to_hub = self.teleop_push_to_hub
+        terminate_on_collision = self.terminate_on_collision
+
+        class _CollisionTerminationWrapper(gym.Wrapper):
+            """Force `terminated=True` whenever the env reports
+            `info["in_collision"]`. SplatSim publishes this key on every
+            step (it's the same predicate the intervention controller
+            uses for its collision trigger), so we just lift it into the
+            gymnasium done-flag so the rollout loop stops the episode
+            immediately. No-op if `in_collision` is missing from info.
+            """
+
+            def step(self, action):
+                obs, reward, terminated, truncated, info = self.env.step(action)
+                if info.get("in_collision"):
+                    terminated = True
+                return obs, reward, terminated, truncated, info
+
+        def _wrap_for_collision_termination(env):
+            """Apply the collision-termination wrapper when configured.
+            Pure no-op when terminate_on_collision is False — same as
+            other optional wrappers in this file."""
+            if terminate_on_collision:
+                env = _CollisionTerminationWrapper(env)
+            return env
 
         def _wrap_for_recording(env):
             """Apply TeleopRecordingWrapper when teleop recording is configured."""
@@ -734,6 +771,11 @@ class SplatSimEnv(EnvConfig):
                     max_episode_steps=episode_length,
                     include_oracle_info=include_oracle_info,
                 )
+                # Collision-termination first, then teleop recording (so the
+                # recorder sees the same terminated flag that the rollout
+                # loop sees; otherwise it would record a partial episode
+                # without knowing the episode ended early).
+                env = _wrap_for_collision_termination(env)
                 return _wrap_for_recording(env)
         else:
             from splatsim.gym_env import make_single_env
@@ -765,6 +807,11 @@ class SplatSimEnv(EnvConfig):
                     env.robot_server._max_episode_steps = episode_length
                 if hasattr(env, "_max_episode_steps"):
                     env._max_episode_steps = episode_length
+                # Collision-termination first, then teleop recording (so the
+                # recorder sees the same terminated flag that the rollout
+                # loop sees; otherwise it would record a partial episode
+                # without knowing the episode ended early).
+                env = _wrap_for_collision_termination(env)
                 return _wrap_for_recording(env)
 
         # When the caller asks for AsyncVectorEnv, use the "forkserver" start

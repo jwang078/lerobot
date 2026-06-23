@@ -354,6 +354,7 @@ def rollout(
         # "this scenario is done" — mark all envs done to exit the loop.
         if intervention_ctx is not None:
             from lerobot.scripts.intervention_controller import (
+                _extract_collision_kind,
                 _extract_in_collision,
                 _extract_orientation_error_deg,
                 _extract_position_error_m,
@@ -362,11 +363,13 @@ def rollout(
 
             scn_success = _extract_success(info)
             in_collision = _extract_in_collision(info)
+            collision_kind = _extract_collision_kind(info)
             position_error_m = _extract_position_error_m(info)
             orientation_error_deg = _extract_orientation_error_deg(info)
             decision = intervention_ctx.controller.tick(
                 success=scn_success,
                 in_collision=in_collision,
+                collision_kind=collision_kind,
                 position_error_m=position_error_m,
                 orientation_error_deg=orientation_error_deg,
             )
@@ -401,6 +404,15 @@ def rollout(
             if key in ("final_obs", "final_info", "is_success", "step_count") or key.startswith("_"):
                 continue  # Skip regular keys
             if isinstance(value, np.ndarray) and value.shape == (env.num_envs,):
+                # Skip object-dtype arrays (strings, None mixes, arbitrary
+                # Python objects). torch.from_numpy would crash on them
+                # and they have no place in the numeric per-step
+                # aggregation pipeline. Sub-envs that need to surface
+                # a categorical to eval_info.json should publish a
+                # parallel `<key>_code: int` (see e.g. SplatSim's
+                # collision_kind / collision_kind_code pair).
+                if value.dtype == object:
+                    continue
                 # For terminated envs, use final_info values (pre-reset) instead of info (post-reset)
                 if key in final_info:
                     value = value.copy()
@@ -504,6 +516,7 @@ def eval_policy(
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     n_episodes: int,
     max_episodes_rendered: int = 0,
+    max_episodes_rendered_failed: int = 0,
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
@@ -515,6 +528,14 @@ def eval_policy(
         policy: The policy.
         n_episodes: The number of episodes to evaluate.
         max_episodes_rendered: Maximum number of episodes to render into videos.
+            These are saved as `eval_episode_0.mp4`, `eval_episode_1.mp4`, etc.
+            in scan-order regardless of success — captures the FIRST N episodes.
+        max_episodes_rendered_failed: ADDITIONAL videos rendered only for episodes
+            the policy failed (i.e. `success == False`). Saved as
+            `eval_episode_failed_0.mp4`, `eval_episode_failed_1.mp4`, etc.
+            Most useful for debugging — most failed episodes are NOT in the
+            first N successful-or-not, so without this they'd never get
+            visualized. Default 0 = legacy behavior (first-N only).
         videos_dir: Where to save rendered videos.
         return_episode_data: Whether to return episode data for online training. Incorporates the data into
             the "episodes" key of the returned dictionary.
@@ -523,8 +544,10 @@ def eval_policy(
     Returns:
         Dictionary with metrics and data regarding the rollouts.
     """
-    if max_episodes_rendered > 0 and not videos_dir:
-        raise ValueError("If max_episodes_rendered > 0, videos_dir must be provided.")
+    if (max_episodes_rendered > 0 or max_episodes_rendered_failed > 0) and not videos_dir:
+        raise ValueError(
+            "If max_episodes_rendered > 0 or max_episodes_rendered_failed > 0, videos_dir must be provided."
+        )
 
     if not isinstance(policy, PreTrainedPolicy):
         exc = ValueError(
@@ -553,13 +576,32 @@ def eval_policy(
     all_info_metrics: dict[str, list[float]] = {}  # Aggregated custom metrics per episode
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
+    n_failed_rendered = 0  # extra budget for failed-only videos
+    any_render_budget = max_episodes_rendered > 0 or max_episodes_rendered_failed > 0
 
     # Callback for visualization.
+    # Frames must be captured WHILE the rollout runs (we can't go back and
+    # re-render afterward), but we don't know which episodes will fail
+    # until the rollout finishes. So when max_episodes_rendered_failed > 0
+    # we have to render every env in every batch up to whatever is needed
+    # — the post-rollout video write step then decides which episodes to
+    # keep based on success status. When max_episodes_rendered_failed == 0
+    # this collapses to the legacy "first N" capture.
     def render_frame(env: gym.vector.VectorEnv):
         # noqa: B023
-        if n_episodes_rendered >= max_episodes_rendered:
+        if not any_render_budget:
             return
-        n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
+        # When the failed-video budget is set we need frames for ALL envs
+        # in this batch (since any one of them might turn out to be a
+        # failure we want to save). When only the first-N budget is set
+        # and it's exhausted, no need to render anything more.
+        if max_episodes_rendered_failed == 0 and n_episodes_rendered >= max_episodes_rendered:
+            return
+        if max_episodes_rendered_failed == 0:
+            n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
+        else:
+            # Render everything in the batch — post-batch logic filters.
+            n_to_render_now = env.num_envs
         if isinstance(env, gym.vector.SyncVectorEnv):
             ep_frames.append(np.stack([env.envs[i].render() for i in range(n_to_render_now)]))  # noqa: B023
         elif hasattr(env, "call"):
@@ -567,7 +609,7 @@ def eval_policy(
             # Covers AsyncVectorEnv and _LazyAsyncVectorEnv (which wraps one).
             ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
 
-    if max_episodes_rendered > 0:
+    if any_render_budget:
         video_paths: list[str] = []
 
     if return_episode_data:
@@ -578,7 +620,7 @@ def eval_policy(
     for batch_ix in progbar:
         # Cache frames for rendering videos. Each item will be (b, h, w, c), and the list indexes the rollout
         # step.
-        if max_episodes_rendered > 0:
+        if any_render_budget:
             ep_frames: list[np.ndarray] = []
 
         if start_seed is None:
@@ -596,7 +638,7 @@ def eval_policy(
             postprocessor=postprocessor,
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
-            render_callback=render_frame if max_episodes_rendered > 0 else None,
+            render_callback=render_frame if any_render_budget else None,
             intervention_ctx=intervention_ctx,
         )
 
@@ -682,28 +724,83 @@ def eval_policy(
                 episode_data = {k: torch.cat([episode_data[k], this_episode_data[k]]) for k in episode_data}
 
         # Maybe render video for visualization.
-        if max_episodes_rendered > 0 and len(ep_frames) > 0:
+        # Two independent budgets:
+        #   1. `max_episodes_rendered` — saves the FIRST N episodes in scan
+        #      order regardless of success. Files: `eval_episode_<i>.mp4`.
+        #   2. `max_episodes_rendered_failed` — saves up to K episodes that
+        #      FAILED, deduped against episodes already saved by (1).
+        #      Files: `eval_episode_failed_<i>.mp4`.
+        # Per-episode success comes from this batch's `batch_successes`
+        # (computed above). The two budgets are processed in the same
+        # loop so both can fire on the same episode (the failed counter
+        # just increments; we don't double-write the same episode).
+        if any_render_budget and len(ep_frames) > 0:
+            # `videos_dir` is guaranteed non-None when any_render_budget
+            # is True (asserted at function entry). assert for the
+            # type-checker so it doesn't flag the mkdir/path-join below.
+            assert videos_dir is not None
             batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
-            for stacked_frames, done_index in zip(
-                batch_stacked_frames, done_indices.flatten().tolist(), strict=False
+            batch_succ_list = batch_successes.flatten().tolist()
+            for ep_in_batch, (stacked_frames, done_index) in enumerate(
+                zip(batch_stacked_frames, done_indices.flatten().tolist(), strict=False)
             ):
-                if n_episodes_rendered >= max_episodes_rendered:
+                if (
+                    n_episodes_rendered >= max_episodes_rendered
+                    and n_failed_rendered >= max_episodes_rendered_failed
+                ):
                     break
-
-                videos_dir.mkdir(parents=True, exist_ok=True)
-                video_path = videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
-                video_paths.append(str(video_path))
-                thread = threading.Thread(
-                    target=write_video,
-                    args=(
-                        str(video_path),
-                        stacked_frames[: done_index + 1],  # + 1 to capture the last observation
-                        env.unwrapped.metadata["render_fps"],
-                    ),
-                )
-                thread.start()
-                threads.append(thread)
-                n_episodes_rendered += 1
+                # Tier 1: first-N quota (unconditional on success).
+                saved_in_tier1 = False
+                if n_episodes_rendered < max_episodes_rendered:
+                    videos_dir.mkdir(parents=True, exist_ok=True)
+                    video_path = videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
+                    video_paths.append(str(video_path))
+                    thread = threading.Thread(
+                        target=write_video,
+                        args=(
+                            str(video_path),
+                            stacked_frames[: done_index + 1],  # + 1 to capture the last observation
+                            env.unwrapped.metadata["render_fps"],
+                        ),
+                    )
+                    thread.start()
+                    threads.append(thread)
+                    n_episodes_rendered += 1
+                    saved_in_tier1 = True
+                # Tier 2: failed-only quota. Skip if this episode succeeded,
+                # or if we already saved it in tier 1 (no double-write —
+                # the failed-budget is for failures NOT in the first N).
+                #
+                # Naming convention: `eval_episode_failed_<absolute_episode_idx>.mp4`
+                # where `absolute_episode_idx` is the position of this episode
+                # in the full eval sequence (NOT a sequential failure counter).
+                # This way the filename directly identifies which scenario
+                # failed — match against `eval_info.json`'s
+                # `per_task[0].metrics.successes[<absolute_episode_idx>]`
+                # to confirm. Useful when only a few episodes in a long
+                # eval failed: filename tells you which ones without
+                # cross-referencing a separate index.
+                if (
+                    not saved_in_tier1
+                    and ep_in_batch < len(batch_succ_list)
+                    and not bool(batch_succ_list[ep_in_batch])
+                    and n_failed_rendered < max_episodes_rendered_failed
+                ):
+                    absolute_episode_idx = batch_ix * env.num_envs + ep_in_batch
+                    videos_dir.mkdir(parents=True, exist_ok=True)
+                    video_path = videos_dir / f"eval_episode_failed_{absolute_episode_idx}.mp4"
+                    video_paths.append(str(video_path))
+                    thread = threading.Thread(
+                        target=write_video,
+                        args=(
+                            str(video_path),
+                            stacked_frames[: done_index + 1],
+                            env.unwrapped.metadata["render_fps"],
+                        ),
+                    )
+                    thread.start()
+                    threads.append(thread)
+                    n_failed_rendered += 1
 
         # refresh=False: see the matching comment on the inner-rollout
         # progbar.set_postfix call. The outer for-loop already triggers a
@@ -1040,6 +1137,7 @@ def eval_one(
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     n_episodes: int,
     max_episodes_rendered: int,
+    max_episodes_rendered_failed: int,
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
@@ -1058,6 +1156,7 @@ def eval_one(
         postprocessor=postprocessor,
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
+        max_episodes_rendered_failed=max_episodes_rendered_failed,
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
@@ -1105,6 +1204,7 @@ def run_one(
     postprocessor,
     n_episodes: int,
     max_episodes_rendered: int,
+    max_episodes_rendered_failed: int,
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
@@ -1130,13 +1230,14 @@ def run_one(
         postprocessor=postprocessor,
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
+        max_episodes_rendered_failed=max_episodes_rendered_failed,
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
         intervention_ctx=intervention_ctx,
     )
     # ensure we always provide video_paths key to simplify accumulation
-    if max_episodes_rendered > 0:
+    if max_episodes_rendered > 0 or max_episodes_rendered_failed > 0:
         metrics.setdefault("video_paths", [])
     return task_group, task_id, metrics
 
@@ -1151,6 +1252,7 @@ def eval_policy_all(
     n_episodes: int,
     *,
     max_episodes_rendered: int = 0,
+    max_episodes_rendered_failed: int = 0,
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
@@ -1240,6 +1342,7 @@ def eval_policy_all(
         postprocessor=postprocessor,
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
+        max_episodes_rendered_failed=max_episodes_rendered_failed,
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,

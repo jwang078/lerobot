@@ -251,7 +251,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Override dataset stats with a custom stats file if specified. This lets multiple
     # policies (e.g. diffusion with chunk_size=8, pi05 with chunk_size=50) share the same
     # dataset on disk while each using their own relative-action normalization stats.
-    if cfg.dataset.stats_path is not None:
+    # Truthy check (not `is not None`) so callers can clear an inherited
+    # `dataset.stats_path` from a resumed train_config.json by passing
+    # `--dataset.stats_path=` (empty string). draccus interprets that
+    # bare-equals as an empty string, not None, so the prior `is not None`
+    # check would crash trying to load `Path("")`. The DAgger orchestrator's
+    # weighted-sampling-mode finetune uses this idiom to disable the
+    # legacy base-stats override (which silently clobbered
+    # `MultiSourceNormalizingDataset`'s aggregation) — see the long comment
+    # in `my_scripts/dagger_orchestrate.sh` for context.
+    if cfg.dataset.stats_path:
         from pathlib import Path
 
         stats_path = Path(cfg.dataset.stats_path)
@@ -585,10 +594,44 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         n_episodes=cfg.eval.n_episodes,
                         videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
                         max_episodes_rendered=5,
+                        # Also save up to 5 failure videos that AREN'T already
+                        # in the first 5 — debugging eval regressions otherwise
+                        # only sees the first 5 episodes, which on a high-
+                        # success policy are usually all wins.
+                        max_episodes_rendered_failed=5,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
                         close_envs_after_eval=False,  # training owns env lifetime; closed at end of train()
                     )
+                # Persist the full eval_info to disk so downstream tooling
+                # (dagger_progress.sh, dagger_plot.py, etc.) can access the
+                # SAME per-task data the standalone lerobot-eval writes —
+                # in particular per-task `successes` + `info_metrics.episode_length`
+                # lists, which the wandb log's aggregated "Suite overall"
+                # entry doesn't preserve. Same dict shape + same serializer
+                # as `lerobot_eval.py:1002`. One file per eval step, keyed
+                # by step_id, alongside the videos_step_<id>/ subdir.
+                import json
+
+                import numpy as np
+
+                def _json_default(obj):
+                    if isinstance(obj, np.generic):
+                        return obj.item()
+                    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+                eval_dir = cfg.output_dir / "eval"
+                eval_dir.mkdir(parents=True, exist_ok=True)
+                eval_info_path = eval_dir / f"eval_info_step_{step_id}.json"
+                try:
+                    with open(eval_info_path, "w") as f:
+                        json.dump(eval_info, f, indent=2, default=_json_default)
+                    logging.info("Wrote eval_info to %s", eval_info_path)
+                except Exception as e:
+                    # Non-fatal — training continues even if the dump
+                    # fails. wandb log scrape is still the fallback.
+                    logging.warning("Failed to write eval_info to %s: %s", eval_info_path, e)
+
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]
 

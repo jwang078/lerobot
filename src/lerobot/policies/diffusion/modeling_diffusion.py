@@ -139,6 +139,22 @@ class DiffusionPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
+    def get_pending_action_chunk(self) -> Tensor | None:
+        """Peek at remaining cached actions in the action queue (non-destructive).
+
+        Each entry pushed into ``self._queues[ACTION]`` has shape
+        ``(B, action_dim)`` (popped one per select_action call). Stacking the
+        remaining entries gives ``(n_remaining_steps, B, action_dim)``.
+        Returns None when the queue is empty (e.g., before first select_action
+        or just after the chunk drained and before regeneration).
+        """
+        if self._queues is None:
+            return None
+        q = self._queues.get(ACTION)
+        if q is None or len(q) == 0:
+            return None
+        return torch.stack(tuple(q), dim=0)
+
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:

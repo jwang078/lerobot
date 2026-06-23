@@ -150,6 +150,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             stats_paths=cfg.dataset.stats_paths,
             features={**cfg.policy.input_features, **cfg.policy.output_features},
             norm_map=cfg.policy.normalization_mapping,
+            norm_mode=cfg.dataset.norm_mode,
         )
 
     if cfg.dataset.use_imagenet_stats:

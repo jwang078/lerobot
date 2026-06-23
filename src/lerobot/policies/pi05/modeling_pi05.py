@@ -1316,6 +1316,18 @@ class PI05Policy(PreTrainedPolicy):
 
         return self._action_queue.popleft()
 
+    def get_pending_action_chunk(self) -> Tensor | None:
+        """Peek at remaining cached actions in the action queue (non-destructive).
+
+        Each entry pushed into ``self._action_queue`` has shape
+        ``(B, action_dim)`` (popped one per select_action call). Stacking the
+        remaining entries gives ``(n_remaining_steps, B, action_dim)``.
+        Returns None when the queue is empty.
+        """
+        if len(self._action_queue) == 0:
+            return None
+        return torch.stack(tuple(self._action_queue), dim=0)
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
