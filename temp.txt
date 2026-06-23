@@ -1,0 +1,34 @@
+base demo (eps 1-5)  (5 episodes, 1419 frame-pairs, fps=30.0)
+
+SLOW intervention (d5jvm dag1)  (8 episodes, 701 frame-pairs, fps=30.0)
+
+FAST intervention (d5_fast dag1)  (9 episodes, 893 frame-pairs, fps=30.0)
+
+================================================================================
+Per-joint average |Δ| × fps  (= absolute velocity, rad/s)
+================================================================================
+               j1       j2       j3       j4       j5       j6      gripper     overall
+
+base demo (eps 1-5)
+  action       0.1512   0.0714   0.2365   0.2391   0.2977   0.2023   0.0000     0.1712
+  obs.state    0.1511   0.0713   0.2365   0.2395   0.2974   0.2023   0.0000     0.1712
+
+SLOW intervention (d5jvm dag1)
+  action       0.2091   0.0537   0.3521   0.0908   0.2528   0.1007   0.0000     0.1513
+  obs.state    0.2068   0.0530   0.3483   0.0897   0.2505   0.0998   0.0000     0.1497
+
+FAST intervention (d5_fast dag1)
+  action       0.2235   0.0467   0.3593   0.0703   0.2363   0.1004   0.0138     0.1500
+  obs.state    0.2214   0.0462   0.3557   0.0696   0.2352   0.0997   0.0069     0.1478
+
+================================================================================
+Ratios — base demo / intervention  (>1 means intervention moves SLOWER per joint)
+================================================================================
+
+  base / SLOW intervention (d5jvm dag1)
+    action        0.72     1.33     0.67     2.63     1.18     2.01     0.00    overall=1.13
+    obs.state     0.73     1.35     0.68     2.67     1.19     2.03     0.00    overall=1.14
+
+  base / FAST intervention (d5_fast dag1)
+    action        0.68     1.53     0.66     3.40     1.26     2.02     0.00    overall=1.14
+    obs.state     0.68     1.55     0.66     3.44     1.26     2.03     0.00    overall=1.16
