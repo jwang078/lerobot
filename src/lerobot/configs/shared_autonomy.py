@@ -76,12 +76,30 @@ class FutureChunkConfig:
     # chunk (n_remaining_steps from inner_policy.get_pending_action_chunk()).
     # Set to e.g. 8 to cap chunk-check cost at ~8 FK queries per tick.
     horizon_frames: int | None = None
-    # Optional: explicit clearance for FK shielding. None = inherit from
-    # the top-level `rrt_obstacle_clearance` / `rrt_self_collision_clearance`
-    # fields. Override only when you want the shield to be more (or less)
-    # conservative than RRT's planner-time margins.
-    obstacle_clearance: float | None = None
-    self_collision_clearance: float | None = None
+    # Clearances for FK shielding. These INTENTIONALLY default to tight
+    # values (penetration-only) — the shield's job is to PREDICT actual
+    # collisions in the policy's future chunk, not flag near-misses.
+    # Reasoning:
+    #   * The RRT planner's clearance (`rrt_obstacle_clearance`, e.g. 0.02m)
+    #     is for ROUTING — every NON-GOAL waypoint must stay ≥2cm from
+    #     obstacles to give the smoothed trajectory a safety margin. The
+    #     goal pose is exempt (approach/grasp tasks intentionally place
+    #     EE within centimeters of the target).
+    #   * Inheriting that 0.02m here makes the shield fire whenever the
+    #     policy's chunk takes the EE near the goal — same false positive
+    #     class the controller-side per-tick check has. Tight (≈0)
+    #     clearance avoids those near-miss false positives so the shield
+    #     only preempts the policy when its chunk would actually overlap
+    #     the obstacle geometry.
+    #   * If you specifically want the shield to be MORE conservative than
+    #     the env (e.g., to leave room for ruckig-smoothing-induced
+    #     deviation), bump these explicitly to a small positive value
+    #     (e.g. 0.005m for 5mm). Avoid setting > the planner's clearance
+    #     — that contradicts the planning contract.
+    # None = inherit from `rrt_obstacle_clearance` / `rrt_self_collision_clearance`
+    # (legacy default).
+    obstacle_clearance: float | None = 0.0
+    self_collision_clearance: float | None = 0.0
 
 
 @dataclass
@@ -101,7 +119,9 @@ class SharedAutonomyConfig:
     apply_to_first_action_only: bool = True
     show_slider: bool = True  # launch a Tkinter slider to adjust forward_flow_ratio live
     start_paused: bool = False  # start with policy paused (unpause via GUI button)
-    robot_name: str = "robot_iphone_w_engine_new"
+    # Must match SplatSimEnv.robot_name / the SplatSim server's --robot_name
+    # (see the note on SplatSimEnv.robot_name in envs/configs.py for why).
+    robot_name: str = "robot_iphone_w_engine_curtain"
     max_joint_delta: float = 0.016
     num_dofs: int = 6
     blend_mode: str = "every_step"  # "every_step" or "once_per_chunk"
@@ -251,6 +271,27 @@ class SharedAutonomyConfig:
     # `check_links_in_collision` / `get_path` call.
     rrt_obstacle_clearance: float | None = None
     rrt_self_collision_clearance: float | None = None
+    # In-progress collision clearances — used by the intervention controller's
+    # per-tick "is the robot CURRENTLY in collision?" check during RRT
+    # execution (drives the `request_retry_after_collision` trigger). Kept
+    # SEPARATE from the planning clearances above for a specific reason:
+    #
+    #   * Planning clearance (`rrt_obstacle_clearance`) keeps NON-GOAL
+    #     waypoints clear of obstacles by ≥ 2 cm — a routing safety margin.
+    #     The goal pose itself is EXEMPT (approach/grasp tasks intentionally
+    #     place the EE within centimeters of the target object).
+    #   * Per-tick check needs a clearance that catches the "joint physically
+    #     wedged" case (state can't track command — actual contact distance
+    #     ≈ 0) WITHOUT flagging the legitimate goal-approach case (state
+    #     moving normally; EE within 1-2 cm of the target object by design).
+    #
+    # An intermediate value (default 1 cm obstacle, 2 mm self) sits between
+    # the env's 0.0 penetration-only check (misses wedges) and the planner's
+    # 2 cm path clearance (false-positives on goal approach). None = inherit
+    # the corresponding `rrt_*_clearance` value above (legacy behavior, kept
+    # for back-compat with configs that don't set these fields explicitly).
+    rrt_in_progress_obstacle_clearance: float | None = 0.01
+    rrt_in_progress_self_collision_clearance: float | None = 0.002
     # Non-adjacent robot-link pairs to EXCLUDE from self-collision checks.
     # Use for URDF link pairs that are structurally close at every valid
     # joint config (e.g. UR's base_link(0) vs upper_arm_link(2), ~4 mm apart
@@ -264,6 +305,40 @@ class SharedAutonomyConfig:
     # SplatSim env. For the UR robot in the small-engine scene, the
     # canonical setting is `[[0, 2]]`.
     rrt_self_collision_skip_pairs: list[list[int]] | None = None
+    # When True, the IK-candidate filter inside the planner skips
+    # gripper-finger ⟷ obstacle pairs (auto-detected by URDF link name —
+    # any link whose name contains "finger" or "knuckle"). Motivation: at
+    # grasp goals the fingers are intentionally within mm of the target
+    # object, so the global `rrt_obstacle_clearance` (e.g. 2 cm) rejects
+    # nearby IK branches and forces RRT to pick a distant detour goal
+    # (observed: 2/32 IK candidates clearance-safe, closest 4.93 rad
+    # away). The arm-link clearance check still runs on every other link,
+    # and the FULL RRT path search / per-tick mid-execution check /
+    # future-chunk predictive shield are UNCHANGED — only the IK
+    # candidate filter is relaxed. False (default) preserves historical
+    # strict-everywhere behavior.
+    rrt_ik_skip_gripper_obstacle_pairs: bool = False
+    # Margin multiplier on the planner's obstacle clearance used by the
+    # contact-normal escape (RRTToGoalPlanner._escape_collision) to set
+    # how far past the BiRRT collision threshold the escape pushes before
+    # declaring "clear". 1.5× default = ~50% margin so subsequent ruckig
+    # motion doesn't immediately dip back into the threshold and trigger
+    # the controller's per-tick check (cascade-retry symptom). Set to 1.0
+    # to disable the margin (restores historical "escape stops exactly at
+    # threshold" behavior — risks the cascade on approach/grasp tasks).
+    rrt_escape_clearance_factor: float = 1.5
+    # Margin multiplier specifically for the policy-history rewind escape
+    # (RRTToGoalPlanner._escape_via_policy_history_rewind). Rewind picks a
+    # REAL historical policy frame (already well-formed, robot was moving
+    # normally at that tick) rather than synthesizing a config at the
+    # boundary, so it tolerates a smaller margin than contact-normal
+    # escape. None = inherit `rrt_escape_clearance_factor` (back-compat,
+    # same strict 1.5× filter — fails more often on grasp approach
+    # buffers where every frame is within 30 mm of the target object).
+    # Lower values (e.g. 1.0-1.2) let rewind accept frames closer to
+    # "now" — more in-distribution starts for the recorded RRT chunk,
+    # at the cost of less margin against the ramp-up dip.
+    rrt_rewind_clearance_factor: float | None = None
     # If True (default), ruckig time-parametrization splits the smoothed RRT
     # path at sharp-angle waypoints (angle > 45°) and runs ruckig per-segment
     # with zero velocity at every sharp boundary — historical "stop-and-go"
@@ -296,6 +371,44 @@ class SharedAutonomyConfig:
     #              iterating on the skip list across many paths.
     # Has no effect when `rrt_path_selection != "min_pair_clearance"`.
     rrt_diagnostic_log_pairs: str = "off"
+    # ── Drift-abort guard ────────────────────────────────────────────────
+    # Cancel an in-flight RRT chunk when the robot stops following it. During
+    # playback the wrapper measures per-tick drift = ||actual_q - commanded
+    # waypoint||. On clean execution this stays ~0.03 rad; when the arm wedges
+    # against geometry (lever / target object / a contact the env's
+    # penetration-only `in_collision` flag misses) the joint stalls while the
+    # open-loop ruckig command marches on, and drift grows monotonically to
+    # 1+ rad. That runaway gets recorded as a (state, action) pair off-manifold
+    # by ~1.5 rad, which is corrosive to DAgger training. When drift exceeds
+    # `rrt_abort_on_drift_rad` for `rrt_abort_on_drift_ticks` CONSECUTIVE ticks,
+    # cancel the chunk (the recorder then drops the short fragment) so the
+    # runaway never reaches the dataset. Independent of the collision check:
+    # catches stalls the env doesn't flag as collisions, and fires regardless
+    # of lookback. Set `rrt_abort_on_drift_rad=0.0` to disable. The default
+    # 0.15 rad sits well above clean tracking (~0.03) and legitimate transients;
+    # 8 consecutive ticks (~0.27 s at 30 Hz) avoids aborting on a brief recover.
+    rrt_abort_on_drift_rad: float = 0.15
+    rrt_abort_on_drift_ticks: int = 8
+    # What the drift-abort DOES once a stall is detected. The episode is ALWAYS
+    # discarded (no drift frames reach the dataset) regardless of this setting;
+    # this only controls whether — and how — RRT re-plans afterward. This is the
+    # single knob to make a drift stall behave "like the other triggers":
+    #   "discard"     — drop the chunk + episode, return control to the policy.
+    #                   A fresh RRT cycle re-triggers later only if the policy
+    #                   stalls/collides again.
+    #   "lookback"    — drop + re-plan WITH a pre-jump lookback rewind, exactly
+    #                   like the "time stall" / "no_progress" triggers in
+    #                   pre_jump_lookback / hybrid mode (default — a wedged chunk
+    #                   should re-attempt the intervention, not just give up).
+    #   "no_lookback" — drop + re-plan from the robot's CURRENT pose (no rewind),
+    #                   like the collision triggers. Given lookback teleports
+    #                   land poorly when the rewound pose conflicts with the
+    #                   un-rewound scene, this is usually the better escape.
+    # The wrapper detects the stall and requests the re-plan; the controller
+    # dispatches it through the SAME `_trigger_source` machinery the other
+    # triggers use (reason="drift_stall"), so lookback/no-lookback stay
+    # consistent with the rest of the system.
+    rrt_drift_trigger: str = "lookback"
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.forward_flow_ratio <= 1.0:
@@ -314,6 +427,17 @@ class SharedAutonomyConfig:
             raise ValueError(
                 f"rrt_diagnostic_log_pairs must be one of {valid_diag_modes}, "
                 f"got '{self.rrt_diagnostic_log_pairs}'"
+            )
+        if self.rrt_abort_on_drift_rad < 0.0:
+            raise ValueError(
+                f"rrt_abort_on_drift_rad must be >= 0 (0 disables), got {self.rrt_abort_on_drift_rad}"
+            )
+        if self.rrt_abort_on_drift_ticks < 1:
+            raise ValueError(f"rrt_abort_on_drift_ticks must be >= 1, got {self.rrt_abort_on_drift_ticks}")
+        valid_drift_triggers = {"discard", "lookback", "no_lookback"}
+        if self.rrt_drift_trigger not in valid_drift_triggers:
+            raise ValueError(
+                f"rrt_drift_trigger must be one of {valid_drift_triggers}, got '{self.rrt_drift_trigger}'"
             )
         valid_collision_modes = {"pre_jump_lookback", "future_chunk", "hybrid"}
         if self.rrt_collision_detection not in valid_collision_modes:

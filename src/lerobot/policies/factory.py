@@ -550,8 +550,16 @@ def _wrap_with_shared_autonomy(policy, cfg):
         rrt_num_ik_candidates=sa_cfg.rrt_num_ik_candidates,
         rrt_obstacle_clearance=sa_cfg.rrt_obstacle_clearance,
         rrt_self_collision_clearance=sa_cfg.rrt_self_collision_clearance,
+        rrt_in_progress_obstacle_clearance=sa_cfg.rrt_in_progress_obstacle_clearance,
+        rrt_in_progress_self_collision_clearance=sa_cfg.rrt_in_progress_self_collision_clearance,
         rrt_self_collision_skip_pairs=sa_cfg.rrt_self_collision_skip_pairs,
         rrt_diagnostic_log_pairs=sa_cfg.rrt_diagnostic_log_pairs,
+        rrt_ik_skip_gripper_obstacle_pairs=sa_cfg.rrt_ik_skip_gripper_obstacle_pairs,
+        rrt_escape_clearance_factor=sa_cfg.rrt_escape_clearance_factor,
+        rrt_rewind_clearance_factor=sa_cfg.rrt_rewind_clearance_factor,
+        rrt_abort_on_drift_rad=sa_cfg.rrt_abort_on_drift_rad,
+        rrt_abort_on_drift_ticks=sa_cfg.rrt_abort_on_drift_ticks,
+        rrt_drift_trigger=sa_cfg.rrt_drift_trigger,
     )
 
     # Connect shared context for teleop recording (if active)

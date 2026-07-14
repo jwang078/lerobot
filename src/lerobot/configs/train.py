@@ -327,6 +327,23 @@ class TrainPipelineConfig(HubMixin):
                     "`dataset.repo_ids` must be a non-empty list of dataset repo ids "
                     f"in multi-dataset mode. Got {self.dataset.repo_ids!r}."
                 )
+            # `stats_path` (singular, single-dataset override) is mutually
+            # exclusive with multi-dataset mode. lerobot_train.py applies it
+            # AFTER make_dataset, which would silently CLOBBER the per-source
+            # `norm_mode` aggregation — turning every run into effective
+            # "base_only" regardless of --norm_mode. Per-source stats go through
+            # `stats_paths` (plural) instead. Fail loudly rather than silently
+            # normalize incorrectly. (resume_training.sh clears an inherited stats_path
+            # by forwarding `--dataset.stats_path=`, which is falsy here.)
+            if self.dataset.stats_path:
+                raise ValueError(
+                    "`dataset.stats_path` (single-dataset stats override) cannot be "
+                    "combined with `dataset.repo_ids` (multi-dataset weighted-sampling "
+                    "mode): it is applied after dataset construction and would silently "
+                    "override the per-source `norm_mode` aggregation. Use per-source "
+                    "`dataset.stats_paths` (plural) + `--norm_mode` instead, and clear any "
+                    f"inherited path with `--dataset.stats_path=`. Got stats_path={self.dataset.stats_path!r}."
+                )
             n = len(self.dataset.repo_ids)
             if self.dataset.sample_weights is None or len(self.dataset.sample_weights) != n:
                 raise ValueError(

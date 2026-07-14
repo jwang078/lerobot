@@ -673,7 +673,13 @@ class SplatSimEnv(EnvConfig):
     task_description: str | None = None
 
     # SplatSim-specific config
-    robot_name: str = "robot_iphone_w_engine_new"
+    # Default aligned with SmallEnginePybulletRobotServer's current
+    # `background_splat_name` — the robot splat + scene splat must come from
+    # the same Gaussian training session or the wrist camera renders into
+    # empty space (correct pose in the wrong coordinate frame). If you swap
+    # scene splats on the SplatSim side, update both here and every other
+    # `robot_iphone_w_engine_*` default in this repo.
+    robot_name: str = "robot_iphone_w_engine_curtain"
     cam_i: int = 3
     camera_names: list[str] = field(default_factory=lambda: ["base_rgb", "wrist_rgb"])
     use_gripper: bool = True
@@ -727,9 +733,9 @@ class SplatSimEnv(EnvConfig):
     # Wrist camera model version (see WRIST_CAM_FISHEYE_CALIBRATIONS in
     # splatsim/robots/sim_robot_pybullet_base.py):
     #   0 = pinhole using base camera intrinsics (matches pre-fisheye datasets)
-    #   1 = fisheye, original 2704x2028 GoPro calibration (default)
-    #   2 = fisheye, recalibrated 1920x1080 GoPro calibration
-    wrist_cam_ver: int = 1
+    #   1 = fisheye, original 2704x2028 GoPro calibration
+    #   2 = fisheye, recalibrated 1920x1080 GoPro calibration (default)
+    wrist_cam_ver: int = 2
 
     # Teleop recording: save pure-teleop (ratio=0) segments to a LeRobot dataset.
     # Set to a repo ID (e.g. "user/teleop-data") to enable; None to disable.
@@ -740,6 +746,40 @@ class SplatSimEnv(EnvConfig):
     # local-only (used by dagger_orchestrate.sh's offline mode to avoid round-
     # tripping each round's intervention dataset through the Hub).
     teleop_push_to_hub: bool = True
+    # Short-episode behavior. True (default, legacy): episodes shorter than
+    # `teleop_min_episode_length` get padded by repeating the last committed
+    # frame. False: drop those episodes entirely instead of padding. The
+    # padded frames are exact repeats (state diff = 0, action = last
+    # commanded), so they train the policy with ~min_episode_length samples
+    # of `obs = (near_goal, near_goal) → action = hold`, which biases the
+    # diffusion score field toward "freeze when close to goal" — manifests
+    # at eval as the policy stopping a few cm short of goal. For DAgger /
+    # intervention recording, set this False (pass
+    # `--env.teleop_pad_short_episodes=false` in --intervention_extra_args).
+    teleop_pad_short_episodes: bool = True
+    # Recorder-side state-discontinuity threshold (joint-L2 of Δstate
+    # between consecutive real frames, radians). When exceeded,
+    # TeleopRecordingWrapper finalizes the current episode and starts a
+    # fresh one — regardless of whether the upstream RRT source signaled
+    # a teleport.
+    #
+    # The source-side signal (`force_episode_split_next_real_frame`, set
+    # by `_teleport_env_to_q_start`) only covers LEROBOT-driven env
+    # teleports (lookback rewind, escape from q_start-in-collision,
+    # request_retry_after_collision). It cannot cover PyBullet's
+    # constraint-solver position corrections — those fire when a robot
+    # link physically penetrates an obstacle during ruckig-smoothed RRT
+    # execution (env-physics, never touches our code), and produce
+    # multi-rad state jumps with no source-side hook to signal them.
+    # The recorder-side threshold check IS the only mechanism that can
+    # split on those.
+    #
+    # Default 0.15 rad/frame sits between ruckig-bounded RRT motion
+    # (~0.1 rad/frame max) and typical teleport / collision-correction
+    # magnitudes (~0.3-3 rad). Set to 0 to disable (source-side signal
+    # still applies). Tighten if your recorded data still shows
+    # within-episode jumps; loosen if normal fast motion false-splits.
+    teleop_state_jump_split_threshold_rad: float = 0.15
 
     # Image dimensions
     observation_height: int = 224
@@ -841,6 +881,12 @@ class SplatSimEnv(EnvConfig):
             from lerobot.policies.teleop_recording import TeleopRecordingContext
 
             teleop_context = TeleopRecordingContext.get_instance()
+            # Push the user-configured discontinuity threshold into the
+            # singleton context so TeleopRecordingWrapper.step() picks it
+            # up. Set here (not as a TeleopRecordingWrapper ctor arg) so
+            # external callers that share the singleton read the same
+            # value.
+            teleop_context.state_jump_split_threshold_rad = float(self.teleop_state_jump_split_threshold_rad)
             image_keys = [f"{cam}_{mode.value}" for cam in self.camera_names for mode in ImageResizeMode]
             teleop_dataset = load_lerobot_dataset(self.teleop_dataset_repo_id)
             if teleop_dataset is None:
@@ -853,6 +899,7 @@ class SplatSimEnv(EnvConfig):
         episode_length = self.episode_length
         teleop_min_episode_length = self.teleop_min_episode_length
         teleop_push_to_hub = self.teleop_push_to_hub
+        teleop_pad_short_episodes = self.teleop_pad_short_episodes
         terminate_on_collision = self.terminate_on_collision
 
         class _CollisionTerminationWrapper(gym.Wrapper):
@@ -894,6 +941,7 @@ class SplatSimEnv(EnvConfig):
                     task=task,
                     min_episode_length=teleop_min_episode_length,
                     push_to_hub=teleop_push_to_hub,
+                    pad_short_episodes=teleop_pad_short_episodes,
                 )
             return env
 

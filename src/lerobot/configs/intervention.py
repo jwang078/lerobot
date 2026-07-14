@@ -109,3 +109,30 @@ class InterventionConfig:
     # the scenario is abandoned.
     max_plan_failures: int = 5
     max_backoff_rounds_per_scenario: int = 3
+    # Stuck-detection gate for the planner-side `in_collision` signal.
+    # When the controller's planner-clearance check (using
+    # `rrt_in_progress_obstacle_clearance` / self_collision_clearance from
+    # SharedAutonomyConfig) reports the robot is in (or near) collision,
+    # the intervention trigger only fires if the robot is ALSO stuck —
+    # i.e., the joint-L2 |Δstate| over the last `stuck_consecutive_ticks`
+    # ticks has stayed below `stuck_threshold_rad_per_tick` every tick.
+    # Together the two conditions distinguish:
+    #   * WEDGE (true positive)  : in_collision + can't move → fire retry.
+    #     PD controller pushing but contact stops the joint; |Δq| ≈ 0
+    #     for many ticks. Recording this without intervention leaks
+    #     "stuck pose" frames into the dataset.
+    #   * APPROACH-NEAR-OBSTACLE (false positive) : in_collision + moving.
+    #     Trajectory passes near scene geometry (often the GOAL is itself
+    #     within clearance of the lever) but the robot is still tracking
+    #     the command. No intervention needed.
+    # Gate applies to BOTH: (a) the new-cycle "obstacle_collision" trigger
+    # (controller observes policy heading into collision) and (b) the
+    # mid-RRT-execution retry (controller observes RRT chunk colliding).
+    # Set `stuck_threshold_rad_per_tick = 0` to disable the gate and
+    # restore the legacy "fire on every in_collision tick" behavior.
+    # Defaults: 0.005 rad/tick ≈ 0.15 rad/s at 30 Hz (an order of magnitude
+    # below normal commanded motion ~0.02-0.05 rad/tick), 3 ticks ≈ 100 ms
+    # (quick to react when actually stuck without burst-firing on a single
+    # slow frame).
+    stuck_threshold_rad_per_tick: float = 0.005
+    stuck_consecutive_ticks: int = 3

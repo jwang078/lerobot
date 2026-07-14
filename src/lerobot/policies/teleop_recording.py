@@ -153,6 +153,53 @@ class TeleopRecordingContext:
         # accelerating from a stopped state. Auto-consumed (reset to 0) by
         # _flush_buffer so it only affects one segment per set.
         self.rrt_extra_leading_trim: int = 0
+        # When True (default — interactive teleop legacy), episodes shorter
+        # than min_episode_length get padded by repeating the last committed
+        # frame until they reach the minimum. When False, those episodes are
+        # DROPPED entirely instead of padded. The intervention controller
+        # sets this to False: pad frames in RRT-recorded episodes are
+        # near-goal-state frozen repeats that train the diffusion policy's
+        # score field to "hold position when close to goal" — at eval time
+        # that fires as "freeze a few cm short of goal", which is the
+        # dominant failure mode in DAgger rounds with short final-approach
+        # interventions. See diagnostic in plot_episode_onset_deltas.py
+        # (any episode where ds[20:].mean() == 0 is a padded episode).
+        self.pad_short_episodes: bool = True
+        # Signal: "the env's joint state was just mutated outside the normal
+        # env.step path — finish the current episode and start a fresh one
+        # on the NEXT real frame." Set by _teleport_env_to_q_start whenever
+        # the planner explicitly teleports the env (lookback rewind, escape
+        # from q_start-in-collision, request_retry_after_collision). The
+        # flag is consumed (cleared) by the wrapper's step() the next time
+        # it observes is_real_frame=True.
+        #
+        # Why we ALSO need the recorder-side threshold check below: this
+        # signal only covers LEROBOT-driven teleports. PyBullet's
+        # constraint solver applies position corrections when the robot
+        # link physically penetrates an obstacle during ruckig-smoothed
+        # RRT execution — those state jumps come from env physics, never
+        # touch any of our code, and so can't be source-signaled. The
+        # recorder-side threshold check at TeleopRecording.step() catches
+        # them by inspecting the actual Δstate at the recorder level.
+        self.force_episode_split_next_real_frame: bool = False
+        # Recorder-side state-discontinuity threshold (joint-L2 of Δstate
+        # between consecutive real frames, radians). When exceeded,
+        # TeleopRecording.step() finalizes the current episode and starts
+        # a fresh one — REGARDLESS of whether anyone signaled a teleport.
+        #
+        # Backup for the source-side signal above: the signal can't reach
+        # PyBullet's penetration-correction state changes (env-physics,
+        # invisible to lerobot). The threshold check is the only
+        # mechanism that can split on those.
+        #
+        # Contract: each recorded episode is one continuous trajectory.
+        # Any inter-frame Δstate > this threshold ends the prior episode
+        # there, no exceptions.
+        #
+        # Default 0.15 rad/frame ≈ 4.5 rad/s at 30 Hz, well above ruckig-
+        # bounded RRT motion (~0.1 rad/frame max) but below typical
+        # teleport magnitudes (~0.3-3 rad). Set to 0 to disable.
+        self.state_jump_split_threshold_rad: float = 0.15
 
     @classmethod
     def get_instance(cls) -> TeleopRecordingContext:
@@ -194,6 +241,7 @@ class TeleopRecordingWrapper(gym.Wrapper):
         task: str,
         min_episode_length: int = 60,
         push_to_hub: bool = True,
+        pad_short_episodes: bool = True,
     ) -> None:
         super().__init__(env)
         self._context = context
@@ -206,6 +254,13 @@ class TeleopRecordingWrapper(gym.Wrapper):
         # pipelines (e.g. the DAgger orchestrator) that don't want to round-
         # trip each round's intervention dataset through HuggingFace Hub.
         self._push_to_hub = push_to_hub
+        # Mirror to the context so _finish_episode can branch on it.
+        # See TeleopRecordingContext.pad_short_episodes docstring + envs/
+        # configs.py:teleop_pad_short_episodes for the rationale. Setting
+        # this False (intervention recording) drops short episodes instead
+        # of padding them — last-frame-repeat padding teaches the diffusion
+        # policy to freeze near goal.
+        self._context.pad_short_episodes = pad_short_episodes
 
         self._recording: bool = False
         self._padding: bool = False
@@ -217,6 +272,12 @@ class TeleopRecordingWrapper(gym.Wrapper):
         # min_episode_length, since no further env steps are available to
         # source live padding frames from.
         self._last_committed_frame: dict | None = None
+        # Previous REAL-FRAME observation.state, kept across step() calls
+        # for the recorder-side state-discontinuity check (see
+        # context.state_jump_split_threshold_rad). Reset to None on
+        # _finish_episode / _discard_episode so the next episode's first
+        # real frame doesn't false-split against the previous tail state.
+        self._prev_real_frame_state: np.ndarray | None = None
         self._context.min_episode_length = min_episode_length
 
         # When ``context.defer_episode_saves`` is True, finished episodes go
@@ -381,24 +442,58 @@ class TeleopRecordingWrapper(gym.Wrapper):
             return
         if self._frame_buffer:
             self._flush_buffer()
-        # Pad short episodes by repeating the last committed frame. Useful when
-        # the env reaches its success condition before min_episode_length —
-        # there are no more env steps to source live padding frames from, so we
-        # duplicate the final observation/action so the trajectory is still
-        # long enough to keep instead of being discarded.
-        if (
-            self._committed_frame_count > 0
-            and self._committed_frame_count < self._min_episode_length
-            and self._last_committed_frame is not None
-        ):
-            n_pad = self._min_episode_length - self._committed_frame_count
-            for _ in range(n_pad):
-                self._emit_frame(dict(self._last_committed_frame))
-            self._committed_frame_count += n_pad
-            logger.info(
-                f"[TeleopRecording] Padded {n_pad} repeated frame(s) of the final "
-                f"observation to reach min_episode_length ({self._min_episode_length})."
-            )
+        # Short-episode handling. Two strategies, selected by
+        # `context.pad_short_episodes` (env config: teleop_pad_short_episodes):
+        #   True (default — interactive teleop legacy): pad by repeating the
+        #     last committed frame until the episode hits min_episode_length.
+        #     OK for human teleop where the demonstrator releases controls at
+        #     goal (frozen-at-goal frames are part of the natural demo).
+        #   False (intervention recording, pass
+        #     `--env.teleop_pad_short_episodes=false` in
+        #     --intervention_extra_args): DROP the episode entirely instead.
+        #     Padded frames are exact repeats (state diff = 0, action = last
+        #     commanded), so they train the policy with ~min_episode_length
+        #     samples of `obs = (near_goal, near_goal) → action = hold` —
+        #     biases the diffusion score field toward "freeze near goal" and
+        #     manifests at eval as the policy stopping a few cm short of
+        #     goal. Dropping 2-6 short demos per round trades a small amount
+        #     of intervention data for keeping the score field clean.
+        if self._committed_frame_count > 0 and self._committed_frame_count < self._min_episode_length:
+            if not self._context.pad_short_episodes:
+                logger.info(
+                    f"[TeleopRecording] Dropping short episode "
+                    f"({self._committed_frame_count} < {self._min_episode_length} frames; "
+                    f"pad_short_episodes=False — last-frame-repeat padding would train "
+                    f"'freeze near goal' into the policy)."
+                )
+                self._in_progress_episode_frames = []
+                self._committed_frame_count = 0
+                self._last_committed_frame = None
+                self._frame_buffer = []
+                self._recording = False
+                self._padding = False
+                self._episode_frame_count = 0
+                # Clear the discontinuity anchor like the normal-path tail
+                # does, so the next episode's first real frame doesn't
+                # false-split against this dropped episode's tail.
+                self._prev_real_frame_state = None
+                # Push the cleared state to the shared context so the SA GUI's
+                # poll sees `recording=False` and reverts the REC label to
+                # "Not recording". Without this, the prior "REC N/60 frames
+                # (too short)" line stays on screen indefinitely (and bleeds
+                # into the next scenario) because no other write to
+                # ctx.recording happens until the next real frame.
+                self._sync_context()
+                return
+            elif self._last_committed_frame is not None:
+                n_pad = self._min_episode_length - self._committed_frame_count
+                for _ in range(n_pad):
+                    self._emit_frame(dict(self._last_committed_frame))
+                self._committed_frame_count += n_pad
+                logger.info(
+                    f"[TeleopRecording] Padded {n_pad} repeated frame(s) of the final "
+                    f"observation to reach min_episode_length ({self._min_episode_length})."
+                )
         if self._committed_frame_count >= self._min_episode_length:
             scenario_idx = self._context.source_scenario_idx
             # Always include the source_scenario_idx key (None when unset) so
@@ -450,6 +545,9 @@ class TeleopRecordingWrapper(gym.Wrapper):
         self._committed_frame_count = 0
         self._frame_buffer.clear()
         self._last_committed_frame = None
+        # Clear the discontinuity-check anchor so the next episode's first
+        # real frame doesn't false-split against this episode's tail.
+        self._prev_real_frame_state = None
         self._sync_context()
 
     def _discard_episode(self) -> None:
@@ -467,6 +565,9 @@ class TeleopRecordingWrapper(gym.Wrapper):
         self._padding = False
         self._episode_frame_count = 0
         self._committed_frame_count = 0
+        # Match _finish_episode: clear the discontinuity anchor so the next
+        # episode's first real frame doesn't false-split against this one.
+        self._prev_real_frame_state = None
         self._sync_context()
 
     # -- deferred-save commit/discard ---------------------------------------
@@ -546,11 +647,79 @@ class TeleopRecordingWrapper(gym.Wrapper):
 
         if is_real_frame:
             if self._padding:
-                # User went back to teleop/RRT while padding — continue same episode.
+                # We were padding the prior cycle's recorded segment when a
+                # NEW cycle's first real-frame arrived. Historical behavior
+                # treated this as "continue the same episode" — but that's
+                # silently wrong for RRT intervention recording: the new
+                # cycle starts at a TELEPORTED env state (lookback rewind or
+                # escape), so concatenating produces a single recorded
+                # episode with a multi-rad state discontinuity in the middle.
+                # That discontinuity then pollutes the chunk-relative action
+                # stats (chunks straddling the boundary report 1+ rad
+                # rel-actions, blowing up aggregated normalization range).
+                #
+                # Fix: treat the prior-segment + padding as ONE episode,
+                # finalize it, and start fresh for the new cycle. Each RRT
+                # cycle gets its own episode → no in-episode teleports →
+                # chunks never span teleports → clean rel-action stats.
+                # `pad_short_episodes=False` flag still applies; if the
+                # prior segment was too short to keep, _finish_episode
+                # drops it.
                 self._padding = False
+                self._finish_episode()
+            elif self._context.force_episode_split_next_real_frame:
+                # Source signaled a mid-cycle teleport just happened (most
+                # commonly: request_retry_after_collision → _do_plan →
+                # escape → env teleport while mode stayed EXECUTING). The
+                # wrapper would normally NOT observe a frame_source
+                # transition (stays RRT through the retry), so without this
+                # flag the post-teleport frames would get appended to the
+                # same episode that contains pre-teleport frames. Force a
+                # split here so the recorded episode boundary aligns with
+                # the planner's chunk boundary. The flag is consumed (cleared)
+                # exactly once per fire, then recording starts fresh.
+                logger.info(
+                    "[TeleopRecording] Mid-cycle teleport signal received — "
+                    "finalizing prior cycle's recording and starting a fresh "
+                    "episode for the post-teleport chunk."
+                )
+                self._context.force_episode_split_next_real_frame = False
+                self._finish_episode()
             self._recording = True
             frame, gym_obs, reward, terminated, truncated, info = self._step_raw(action)
+            # Recorder-side state-discontinuity backup check. Catches
+            # state jumps that bypassed the source-side
+            # `force_episode_split_next_real_frame` signal — most
+            # commonly PyBullet's constraint-solver position corrections
+            # when the robot link physically penetrates an obstacle
+            # during ruckig-smoothed RRT execution (env-physics, never
+            # touches our code). Compare BEFORE buffering so the post-
+            # jump frame becomes the first frame of the NEW episode (not
+            # the last of the old).
+            new_state = frame.get("observation.state")
+            jump_thr = self._context.state_jump_split_threshold_rad
+            if self._prev_real_frame_state is not None and new_state is not None and jump_thr > 0:
+                jump = float(np.linalg.norm(new_state - self._prev_real_frame_state))
+                if jump > jump_thr:
+                    logger.info(
+                        "[TeleopRecording] State discontinuity detected "
+                        "(Δs=%.4f rad > threshold %.4f) — finalizing prior "
+                        "episode and starting a fresh one for the post-jump "
+                        "trajectory.",
+                        jump,
+                        jump_thr,
+                    )
+                    self._finish_episode()
+                    # _finish_episode resets _prev_real_frame_state to None
+                    # and _recording to False. Restore _recording=True for
+                    # the new frame we're about to buffer.
+                    self._recording = True
             self._buffer_frame(frame)
+            if new_state is not None:
+                # Anchor for the next tick's discontinuity check. Plain
+                # reference is safe — observation.state is freshly
+                # constructed each frame by _build_frame.
+                self._prev_real_frame_state = np.asarray(new_state, dtype=np.float32)
             self._episode_frame_count = self._committed_frame_count + len(self._frame_buffer)
             self._sync_context()
             return gym_obs, reward, terminated, truncated, info
