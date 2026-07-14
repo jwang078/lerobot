@@ -223,6 +223,7 @@ def rollout(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     seeds: list[int] | None = None,
+    scenario_indices: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
     recording_dir: Path | None = None,
@@ -256,6 +257,12 @@ def rollout(
         policy: The policy. Must be a PyTorch nn module.
         seeds: The environments are seeded once at the start of the rollout. If provided, this argument
             specifies the seeds for each of the environments.
+        scenario_indices: For envs that select scenarios from an eval benchmark subset, the absolute
+            rollout index of each env in this batch. Forwarded to ``env.reset(options=...)`` as
+            ``{"benchmark_start_index": idx}`` per env. Decouples scenario selection from any stateful
+            per-server counter — SplatSim's ``_handle_reset`` uses this option to force
+            ``subset[idx % len(subset)]`` regardless of prior counter state. Non-SplatSim envs
+            silently ignore the option.
         return_observations: Whether to include all observations in the returned rollout data. Observations
             are returned optionally because they typically take more memory to cache. Defaults to False.
         render_callback: Optional rendering callback to be used after the environments are reset, and after
@@ -268,11 +275,29 @@ def rollout(
     """
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
 
-    # Reset the policy and environments.
+    # Reset the policy and environments. When scenario_indices are provided
+    # AND the vector env has a single sub-env, pass benchmark_start_index in
+    # options so SplatSim (or any env that honors the key) plays a
+    # DETERMINISTIC scenario per rollout, immune to counter drift from
+    # partial prior sessions.
+    #
+    # Gymnasium's SyncVectorEnv.reset fans a single `options` dict out to
+    # every sub-env, so per-env options aren't natively supported. For
+    # num_envs > 1 we skip the override — each parallel env is expected to
+    # be a fresh independent server (own port + own counter), where drift
+    # is not a cross-session concern. Intervention mode is single-env
+    # (validated upstream), so it's covered. Non-SplatSim envs silently
+    # ignore an unknown option key.
     policy.reset()
     # NEW_ROLLOUT_OPTION tells FreezeAfterEpisodeEnd this is a genuine new episode, as
     # opposed to Gymnasium's argument-less autoreset of a sub-env that already finished.
-    observation, info = env.reset(seed=seeds, options={NEW_ROLLOUT_OPTION: True})
+    reset_options: dict[str, Any] = {NEW_ROLLOUT_OPTION: True}
+    if scenario_indices is not None and env.num_envs == 1:
+        assert len(scenario_indices) == 1, (
+            f"scenario_indices length {len(scenario_indices)} != env.num_envs 1"
+        )
+        reset_options["benchmark_start_index"] = int(scenario_indices[0])
+    observation, info = env.reset(seed=seeds, options=reset_options)
     if render_callback is not None:
         render_callback(env)
 
@@ -319,10 +344,14 @@ def rollout(
         ictrl = intervention_ctx.controller
         iteleop = intervention_ctx.teleop_context
         ictrl.reset_for_new_scenario()
-        # scenario_idx counts ALL rollout() calls (whether the episode
-        # ultimately commits or discards). Matches the for-loop variable
-        # semantics from the legacy intervention_record.py rollout.
-        iteleop.source_scenario_idx = intervention_ctx.scenario_idx
+        # source_scenario_idx tags each recorded episode with the UNDERLYING
+        # eval-benchmark index (via benchmark_subset resolution), not the
+        # rollout-local counter. This way dataset episodes downstream can be
+        # joined against the eval benchmark by episode index — even when
+        # --dagger_skip_succeeded_in_prev_eval prunes the subset to a
+        # non-contiguous list. Matches the CSV's scenario_idx column
+        # semantics.
+        iteleop.source_scenario_idx = intervention_ctx.resolve_scenario_idx(intervention_ctx.scenario_idx)
         iteleop.defer_episode_saves = True
         try:
             env_cfgs = env.call("get_env_config")
@@ -640,9 +669,11 @@ def rollout(
         intervention_ctx.n_committed_episodes += n_committed
 
         ctrl = intervention_ctx.controller
+        _resolved_idx = intervention_ctx.resolve_scenario_idx(intervention_ctx.scenario_idx)
         logging.info(
-            "Scenario %d finished: success=%s cycles=%d status=%s (%d episode(s) %s)",
+            "Scenario %d (benchmark ep %d) finished: success=%s cycles=%d status=%s (%d episode(s) %s)",
             intervention_ctx.scenario_idx,
+            _resolved_idx,
             scn_success,
             ctrl.cycles_used,
             ctrl.last_status,
@@ -808,6 +839,11 @@ def eval_policy(
             seeds = range(
                 start_seed + (batch_ix * env.num_envs), start_seed + ((batch_ix + 1) * env.num_envs)
             )
+        # Absolute rollout indices (0-based, independent of start_seed). SplatSim
+        # env's reset uses these via options["benchmark_start_index"] to select
+        # scenario = subset[idx % len(subset)] deterministically, so partial
+        # prior sessions can't misalign scenario 0. Non-SplatSim envs ignore.
+        scenario_indices = list(range(batch_ix * env.num_envs, (batch_ix + 1) * env.num_envs))
         rollout_data = rollout(
             env=env,
             policy=policy,
@@ -816,6 +852,7 @@ def eval_policy(
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             seeds=list(seeds) if seeds else None,
+            scenario_indices=scenario_indices,
             return_observations=return_episode_data,
             render_callback=render_frame if any_render_budget else None,
             recording_dir=recording_dir,
@@ -1270,10 +1307,17 @@ def eval_main(cfg: EvalPipelineConfig):
         sa_policy.set_env_for_teleport(flat_envs[0])
 
         ctrl = InterventionController(sa_policy, cfg.intervention)
+        # Pass the eval-benchmark subset so the per-scenario CSV records the
+        # underlying benchmark index (not the rollout-local counter). When
+        # --dagger_skip_succeeded_in_prev_eval prunes the subset to a
+        # non-contiguous list like [1, 5, 8, 13], the CSV's scenario_idx
+        # column reports those actual indices instead of 0..3.
+        env_subset = getattr(cfg.env, "eval_benchmark_subset", None)
         intervention_ctx = InterventionContext(
             controller=ctrl,
             teleop_context=TeleopRecordingContext.get_instance(),
             csv_path=Path(cfg.output_dir) / "intervention_per_scenario.csv",
+            benchmark_subset=list(env_subset) if env_subset else None,
         )
         intervention_ctx.open_csv()
         logging.info("Intervention config: %s", pformat(asdict(cfg.intervention)))

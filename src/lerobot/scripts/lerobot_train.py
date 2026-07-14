@@ -663,7 +663,6 @@ def train(cfg: TrainPipelineConfig):
         except Exception:
             logging.exception("[norm-stats] failed to introspect live normalizer stats (non-fatal)")
 
-    if is_main_process():
     # Created BEFORE prepare on the unsharded parameters — accelerate's FSDP2 path requires the
     # model and optimizer in one prepare() call and rebinds the param groups itself.
     if is_main_process():
