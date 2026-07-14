@@ -602,6 +602,68 @@ def train(cfg: TrainPipelineConfig):
     else:
         _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
 
+    # ── Debug: surface the normalization stats the policy ACTUALLY uses ──
+    # This is ground truth AFTER all the layering that decides normalization:
+    # single- vs multi-dataset, the norm_mode aggregation, any --dataset.stats_path
+    # override, and (on resume) make_pre_post_processors loading saved processors +
+    # load_state_dict's explicit-stats preservation. Reading the live
+    # NormalizerProcessorStep.stats here tells you exactly what the policy
+    # normalizes against — so you can confirm e.g. aggregated-multi-source vs
+    # base-only, and catch a silent stats_path clobber.
+    if is_main_process():
+        try:
+            import numpy as np  # not imported at module scope in this file
+
+            from lerobot.processor.normalize_processor import (
+                NormalizerProcessorStep,
+                UnnormalizerProcessorStep,
+            )
+
+            def _log_active_norm_stats(pipeline, label: str) -> None:
+                steps = getattr(pipeline, "steps", None) or []
+                for step in steps:
+                    if not isinstance(step, (NormalizerProcessorStep, UnnormalizerProcessorStep)):
+                        continue
+                    stats = getattr(step, "stats", None) or {}
+                    logging.info(
+                        "[norm-stats] %s %s: %d feature(s), _stats_explicitly_provided=%s",
+                        label,
+                        type(step).__name__,
+                        len(stats),
+                        getattr(step, "_stats_explicitly_provided", "?"),
+                    )
+                    for feat in sorted(stats):
+                        fs = stats[feat] or {}
+                        mn, mx = fs.get("min"), fs.get("max")
+                        if "image" in feat or "pixel" in feat or mn is None or mx is None:
+                            # images = IMAGENET stats; just confirm presence.
+                            logging.info("[norm-stats]     %s: stat_keys=%s", feat, sorted(fs))
+                            continue
+                        mn = np.asarray(mn, dtype=np.float64).reshape(-1)
+                        mx = np.asarray(mx, dtype=np.float64).reshape(-1)
+                        logging.info(
+                            "[norm-stats]     %s:\n        min=%s\n        max=%s",
+                            feat,
+                            np.array2string(mn, precision=4, suppress_small=True),
+                            np.array2string(mx, precision=4, suppress_small=True),
+                        )
+
+            # `preprocessor` holds the input normalizer; the postprocessor holds
+            # the action un-normalizer (under SA, it lives on policy.postprocessor).
+            _log_active_norm_stats(preprocessor, "preprocessor")
+            _post = getattr(policy, "postprocessor", None) or postprocessor
+            _log_active_norm_stats(_post, "postprocessor")
+            if cfg.dataset.repo_ids is not None:
+                logging.info(
+                    "[norm-stats] multi-dataset mode: norm_mode=%s over %d source(s); "
+                    "the above is what the policy actually normalizes with.",
+                    cfg.dataset.norm_mode,
+                    len(cfg.dataset.repo_ids),
+                )
+        except Exception:
+            logging.exception("[norm-stats] failed to introspect live normalizer stats (non-fatal)")
+
+    if is_main_process():
     # Created BEFORE prepare on the unsharded parameters — accelerate's FSDP2 path requires the
     # model and optimizer in one prepare() call and rebinds the param groups itself.
     if is_main_process():
@@ -631,6 +693,12 @@ def train(cfg: TrainPipelineConfig):
     finalize_sharded_policy(policy, parallel_dims)
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)
+
+    # Step counter at the start of THIS training-loop invocation. Fresh runs start
+    # at 0; a resume starts at the restored step. env_eval_freq / eval_steps are
+    # applied RELATIVE to this so a resume of N steps with freq=N evaluates at the
+    # END of the run rather than at whichever global multiple lands inside it.
+    initial_step_this_run = step
 
     # --- auxiliaries (after the core assembly, per the construction-order contract) -------------
     sample_weighter = None
@@ -845,8 +913,21 @@ def train(cfg: TrainPipelineConfig):
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
-        is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
-        is_eval_step = cfg.eval_steps > 0 and eval_dataloader is not None and step % cfg.eval_steps == 0
+        # env_eval_freq / eval_steps are applied RELATIVE to the start of this
+        # training run (initial_step_this_run), not to the global step counter.
+        # Fires every freq local steps AND unconditionally at cfg.steps (mirrors
+        # save behavior). Without this, a resume of N steps with freq=N would
+        # fire mid-run at whichever multiple of freq happens to land inside
+        # the run, and skip the end.
+        _local_step = step - initial_step_this_run
+        is_env_eval_step = cfg.env_eval_freq > 0 and (
+            (_local_step > 0 and _local_step % cfg.env_eval_freq == 0) or step == cfg.steps
+        )
+        is_eval_step = (
+            cfg.eval_steps > 0
+            and eval_dataloader is not None
+            and ((_local_step > 0 and _local_step % cfg.eval_steps == 0) or step == cfg.steps)
+        )
 
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
