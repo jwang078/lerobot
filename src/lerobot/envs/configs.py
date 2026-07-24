@@ -790,10 +790,20 @@ class SplatSimEnv(EnvConfig):
     # - "stretch": Resize to fill entire area without keeping aspect ratio (good for diffusion)
     image_resize_modes: list[str] = field(default_factory=lambda: ["letterbox"])
 
-    # State dimension (6 joints + 1 gripper = 7)
+    # Arm DOF count. For the ZMQ (external_port) path this sizes the gym
+    # action/observation spaces; the in-process path reads it from the spawned
+    # server. Default 6 (UR5); set 3 for the planar arm. state/action dims are
+    # num_dofs + 1 (gripper) — keep the three consistent (the env profiles /
+    # train_sweep.sh derive state_dim = action_dim = num_dofs + 1).
+    num_dofs: int = 6
+    # State dimension (num_dofs joints + 1 gripper). Default 7 (UR5).
     state_dim: int = 7
-    # Action dimension (6 joints + 1 gripper = 7)
+    # Action dimension (num_dofs joints + 1 gripper). Default 7 (UR5).
     action_dim: int = 7
+    # Environment-state dimension: width of a SEPARATE observation.environment_state
+    # feature (FeatureType.ENV) holding privileged world state (object coords) for
+    # oracle/state-only policies. 0 → no environment_state feature (default).
+    env_state_dim: int = 0
 
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
@@ -804,6 +814,7 @@ class SplatSimEnv(EnvConfig):
         default_factory=lambda: {
             ACTION: ACTION,
             "agent_pos": OBS_STATE,
+            "environment_state": OBS_ENV_STATE,
             "pixels": OBS_IMAGE,
             "pixels/base_rgb": f"{OBS_IMAGES}.base_rgb",
             "pixels/wrist_rgb": f"{OBS_IMAGES}.wrist_rgb",
@@ -811,8 +822,21 @@ class SplatSimEnv(EnvConfig):
     )
 
     def __post_init__(self):
-        # Set state feature
+        # Set state + action features from the configured dims (the default
+        # `features` factory hardcodes 7 — override so non-UR5 arms like the
+        # 3-joint planar arm get the right shapes, e.g. state_dim/action_dim=4).
         self.features["agent_pos"] = PolicyFeature(type=FeatureType.STATE, shape=(self.state_dim,))
+        self.features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(self.action_dim,))
+
+        # Privileged world state (object coords) as a distinct FeatureType.ENV
+        # input for oracle/state-only policies (e.g. the diffusion policy, which
+        # requires an image OR an environment_state). Omitted when env_state_dim=0.
+        if self.env_state_dim > 0:
+            self.features["environment_state"] = PolicyFeature(
+                type=FeatureType.ENV, shape=(self.env_state_dim,)
+            )
+        else:
+            self.features.pop("environment_state", None)
 
         # Set image features - always use "pixels/<camera_name>" format for consistency
         # This maps to "observation.images.<camera_name>" in LeRobot format
@@ -890,8 +914,20 @@ class SplatSimEnv(EnvConfig):
             image_keys = [f"{cam}_{mode.value}" for cam in self.camera_names for mode in ImageResizeMode]
             teleop_dataset = load_lerobot_dataset(self.teleop_dataset_repo_id)
             if teleop_dataset is None:
+                # Forward EnvConfig's arm/state/env-state dims so the created
+                # dataset's `observation.state`, `action`, and (optional)
+                # `observation.environment_state` feature shapes match what the
+                # env actually emits. Prior default (num_dofs=6, state_dim=None,
+                # env_state_dim=0) was UR5-hardcoded — a planar_3joint run
+                # (num_dofs=3, env_state_dim=6) then hit
+                # "expected shape (7,) got (4,)" at the first frame commit.
                 teleop_dataset = create_lerobot_dataset(
-                    self.teleop_dataset_repo_id, fps=self.fps, image_keys=image_keys
+                    self.teleop_dataset_repo_id,
+                    fps=self.fps,
+                    image_keys=image_keys,
+                    num_dofs=self.num_dofs,
+                    state_dim=self.state_dim,
+                    env_state_dim=self.env_state_dim,
                 )
 
         # Locals captured into _make_splatsim closures below.
@@ -955,6 +991,8 @@ class SplatSimEnv(EnvConfig):
             image_resize_modes = self.image_resize_modes
             observation_height = self.observation_height
             observation_width = self.observation_width
+            num_dofs = self.num_dofs
+            env_state_dim = self.env_state_dim
 
             def _make_splatsim():
                 env = ZMQSplatSimGymEnv(
@@ -962,12 +1000,13 @@ class SplatSimEnv(EnvConfig):
                     port=external_port,
                     camera_names=camera_names,
                     image_resize_modes=image_resize_modes,
-                    num_dofs=6,
+                    num_dofs=num_dofs,
                     image_height=observation_height,
                     image_width=observation_width,
                     render_mode=splatsim_render_mode,
                     max_episode_steps=episode_length,
                     include_oracle_info=include_oracle_info,
+                    env_state_dim=env_state_dim,
                 )
                 # Collision-termination first, then teleop recording (so the
                 # recorder sees the same terminated flag that the rollout

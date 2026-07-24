@@ -119,11 +119,21 @@ class SharedAutonomyConfig:
     apply_to_first_action_only: bool = True
     show_slider: bool = True  # launch a Tkinter slider to adjust forward_flow_ratio live
     start_paused: bool = False  # start with policy paused (unpause via GUI button)
-    # Must match SplatSimEnv.robot_name / the SplatSim server's --robot_name
-    # (see the note on SplatSimEnv.robot_name in envs/configs.py for why).
-    robot_name: str = "robot_iphone_w_engine_curtain"
+    # Robot splat name — resolves to a URDF via SplatObjectConfig.
+    # `None` (default) = auto-detect from the env's oracle_env_config on the
+    # first select_action call (env must have `--env.include_oracle_info=true`).
+    # Set explicitly (e.g. "robot_iphone_w_engine_curtain", "planar_3joint")
+    # when the env doesn't publish oracle info OR to pin a specific URDF.
+    # Historical default was "robot_iphone_w_engine_curtain"; now None so new
+    # robots (planar_3joint, future variants) don't crash the wrapper by
+    # loading the wrong URDF.
+    robot_name: str | None = None
     max_joint_delta: float = 0.016
-    num_dofs: int = 6
+    # Arm-joint DOF count (excludes gripper). `None` (default) = auto-detect
+    # from the inner policy's action-feature-names by counting non-gripper
+    # entries; falls back to (action_dim - 1) if names aren't available.
+    # Set explicitly to override the heuristic.
+    num_dofs: int | None = None
     blend_mode: str = "every_step"  # "every_step" or "once_per_chunk"
     # Number of action steps at the start of each chunk to anchor exactly to guidance via inpainting.
     # 0 = current behavior (full-chunk blending only). k > 0 = clamp first k steps to guidance
@@ -132,6 +142,39 @@ class SharedAutonomyConfig:
     n_anchor_steps: int = 0
     debug: bool = False
     debug_maxlen: int = 100
+    # DEBUG-ONLY: force the future-chunk shield to report a collision every
+    # tick regardless of the actual FK check. Exercises the full shield-trigger
+    # path (denormalize_chunk_to_raw + _flush_inner_action_queue +
+    # _rrt_source.trigger) at 100% duty cycle so bugs that only manifest under
+    # heavy shield firing (e.g. per-tick oscillation from queue thrashing or
+    # shared-anchor mutation) are reproducible even in a scenario with no
+    # real collisions. Leave False in normal runs. Requires
+    # `rrt_collision_detection` ∈ {"future_chunk", "hybrid"} to have any
+    # effect.
+    # Rate-limit the future-chunk shield: only run `_check_future_chunk_collision`
+    # every N ticks. Default 1 (every tick — legacy behavior). Set to 5-10 when
+    # inference is slow (state-based diffusion, big U-Nets) so the shield's
+    # ~30-100ms per-tick pybullet FK sweep doesn't push total wrapper wall-time
+    # above the env's tick budget — when it does, the sim server keeps
+    # stepping physics under the last commanded target while the client
+    # blocks, and the robot visibly "jumps forward" when the client resumes.
+    # The chunk shifts by only 1 step per tick, so a K-tick skip catches
+    # the same predicted collision K-1 ticks later — still well before it
+    # arrives (collisions are typically 3-8 chunk-steps out).
+    shield_check_every_n_ticks: int = 1
+    debug_shield_force_trigger: bool = False
+    # DEBUG-ONLY: log a snapshot of the SA-wrapper's own postprocessor
+    # RelativeActionsProcessorStep._last_state before AND after every
+    # `_denormalize_chunk_to_raw` call. Combined with a per-tick raw-action
+    # log (add manually in select_action), narrows down whether an anchor
+    # mutation is corrupting the outer postprocessor's decode.
+    debug_shield_trace_anchor: bool = False
+    # DEBUG-ONLY: log per-RRT-tick actual-vs-commanded drift diagnostics
+    # ("RRT drift @ step N/M ..." + full-vector "RRT drift raw @ ..." dumps).
+    # Left off by default because it fires at least once every 10 RRT-chunk
+    # ticks and drowns the rest of the log; enable when debugging phantom
+    # state / rel-action-postprocessor drift bugs.
+    debug_rrt_drift_log: bool = False
     # Control rate (Hz) used by the RRT-to-Goal mode for ruckig time parametrization.
     # Should match the env's fps. Only consulted when the GUI's "RRT to Goal" button
     # is pressed, so a slightly off value just changes the trajectory pacing.
@@ -339,6 +382,26 @@ class SharedAutonomyConfig:
     # "now" — more in-distribution starts for the recorded RRT chunk,
     # at the cost of less margin against the ramp-up dip.
     rrt_rewind_clearance_factor: float | None = None
+    # Final-approach taper for RRT intervention chunks (mirrors SplatSim's
+    # TrajectoryGenModeConfig.final_approach_*, forwarded to
+    # ruckig_parametrize_path): the planned trajectory brakes to a stop this
+    # many rad (joint-space L2) before the goal, then creeps the remainder at
+    # the scaled-down vel/acc limits below. Without it, the time-optimal
+    # profile brakes at max deceleration into the last sample and the
+    # PD-tracked robot carries momentum PAST the goal — recorded intervention
+    # chunks then teach the policy to overshoot, and would be inconsistent
+    # with traj-gen demos (which taper by default). 0.0 disables.
+    rrt_final_approach_dist: float = 0.15
+    rrt_final_approach_vel_scale: float = 0.5
+    rrt_final_approach_acc_scale: float = 0.25
+    # Equalize joint-space path speed across RRT path sections (mirrors
+    # SplatSim's TrajectoryGenModeConfig.uniform_path_speed so intervention
+    # chunks and traj-gen demos share the same execution-speed profile —
+    # keep the two defaults in lockstep). Removes the direction-anisotropy
+    # surging of per-joint box velocity limits. See
+    # ruckig_parametrize_path(uniform_path_speed=). Off by default
+    # (time-optimal, historical); enable together with the SplatSim side.
+    rrt_uniform_path_speed: bool = False
     # If True (default), ruckig time-parametrization splits the smoothed RRT
     # path at sharp-angle waypoints (angle > 45°) and runs ruckig per-segment
     # with zero velocity at every sharp boundary — historical "stop-and-go"

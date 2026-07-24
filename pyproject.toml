@@ -515,6 +515,11 @@ default.extend-ignore-identifiers-re = [
     ".*_thr(?:_.*)?",  # threshold identifiers: abs_thr, ratio_thr, frozen_thr, jump_thr, etc.
 ]
 
+[tool.typos.default.extend-words]
+# RL term of art (2D reaching task), used in env names / docstrings.
+# typos otherwise flags it as `richer` / `reader`.
+reacher = "reacher"
+
 # Docstring coverage gate. `fail-under` is a RATCHET, not a target: it is set just below the currently
 # measured coverage so it passes today, and is raised in the same PR that documents a module. Never set it
 # to a value that fails on main. The destination is 100; see docs/source/writing_docstrings.mdx.

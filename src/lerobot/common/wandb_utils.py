@@ -201,6 +201,16 @@ class WandBLogger:
             else:
                 self._wandb.log(data=batch_data, step=step)
 
+    def finish(self):
+        """Commit any pending history rows and end the run.
+
+        wandb buffers data logged with an explicit `step=` and only commits the
+        row when a higher step is logged or the run is finished. Call this
+        before any teardown that might abort the process (skipping atexit),
+        otherwise the final step's metrics/video are silently dropped.
+        """
+        self._wandb.finish()
+
     def log_video(self, video_path: str, step: int, mode: str = "train"):
         if mode not in {"train", "eval"}:
             raise ValueError(mode)

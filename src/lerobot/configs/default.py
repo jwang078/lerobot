@@ -97,6 +97,15 @@ class DatasetConfig:
     sample_weights: list[float] | None = None
     stats_paths: list[str] | None = None
     norm_mode: str = "aggregated"
+    # Opt into the fork-only WeightedRandomSampler path. When True, requires
+    # `sample_weights` to be set; the DataLoader draws with per-frame
+    # probability so each sub-dataset's expected batch share matches
+    # `sample_weights[i]` (see the block above for semantics). When False
+    # (default), the training loop uses upstream's usual EpisodeAwareSampler
+    # — even if `sample_weights` happens to be set — so upstream users don't
+    # get silently swapped onto a different sampler. Validated at
+    # __post_init__.
+    use_weighted_sampling: bool = False
 
     def __post_init__(self) -> None:
         if self.repo_type not in ("dataset", "bucket"):
@@ -136,6 +145,16 @@ class DatasetConfig:
             raise ValueError(
                 f"norm_mode must be one of {sorted(_allowed_norm_modes)}, got '{self.norm_mode}'"
             )
+        if self.use_weighted_sampling:
+            if self.sample_weights is None:
+                raise ValueError("use_weighted_sampling=true requires sample_weights to be set.")
+            if self.repo_ids is None:
+                raise ValueError("use_weighted_sampling=true requires repo_ids (multi-dataset mode).")
+            if len(self.sample_weights) != len(self.repo_ids):
+                raise ValueError(
+                    f"len(sample_weights)={len(self.sample_weights)} must equal "
+                    f"len(repo_ids)={len(self.repo_ids)} in weighted-sampling mode."
+                )
 
 
 @dataclass
