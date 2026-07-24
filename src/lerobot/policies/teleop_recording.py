@@ -248,6 +248,13 @@ class TeleopRecordingWrapper(gym.Wrapper):
         self._dataset = dataset
         self._image_keys = image_keys
         self._task = task
+        # Whether the DATASET SCHEMA declares an observation.environment_state
+        # feature. When it does, every emitted frame must supply that key
+        # (dataset_writer.validate_frame raises Missing features on any
+        # frame without it). Env exposes it in gym_obs["environment_state"]
+        # when env_state_dim > 0 — copy it through in _build_frame.
+        _feats = getattr(getattr(self._dataset, "meta", None), "features", None) or {}
+        self._include_environment_state = "observation.environment_state" in _feats
         self._min_episode_length = min_episode_length
         # When False, finalize the dataset locally but skip the
         # `self._dataset.push_to_hub()` call in close(). Useful for offline
@@ -307,6 +314,25 @@ class TeleopRecordingWrapper(gym.Wrapper):
             "action": np.asarray(action, dtype=np.float32),
             "task": self._task,
         }
+        if self._include_environment_state:
+            env_state = gym_obs.get("environment_state")
+            if env_state is None:
+                # The dataset schema promised an environment_state feature
+                # (from env_state_dim > 0 at create-time), but the current
+                # step's gym_obs didn't carry one. That's a real invariant
+                # break — e.g. someone constructed the env with a different
+                # env_state_dim than at teleop_dataset creation. Fail loud
+                # here rather than let dataset_writer's validate_frame raise
+                # a less-informative "Missing features" error downstream.
+                raise RuntimeError(
+                    "Teleop dataset declares 'observation.environment_state' "
+                    "but gym_obs has no 'environment_state' key. Check that "
+                    "the SplatSim env's env_state_dim matches what the "
+                    "dataset was created with."
+                )
+            if isinstance(env_state, torch.Tensor):
+                env_state = env_state.cpu().numpy()
+            frame["observation.environment_state"] = np.asarray(env_state, dtype=np.float32)
         for key in self._image_keys:
             img = raw_obs.get(key)
             if img is None:
@@ -687,33 +713,33 @@ class TeleopRecordingWrapper(gym.Wrapper):
                 self._finish_episode()
             self._recording = True
             frame, gym_obs, reward, terminated, truncated, info = self._step_raw(action)
-            # Recorder-side state-discontinuity backup check. Catches
-            # state jumps that bypassed the source-side
-            # `force_episode_split_next_real_frame` signal — most
-            # commonly PyBullet's constraint-solver position corrections
-            # when the robot link physically penetrates an obstacle
-            # during ruckig-smoothed RRT execution (env-physics, never
-            # touches our code). Compare BEFORE buffering so the post-
-            # jump frame becomes the first frame of the NEW episode (not
-            # the last of the old).
+            # Recorder-side state-discontinuity detection. Historically
+            # this ALSO split the episode on the theory that PyBullet's
+            # constraint-solver position corrections (kicked in when the
+            # ruckig-smoothed RRT chunk grazes/penetrates an obstacle)
+            # would pollute rel-action stats for the straddling chunk if
+            # left inside one episode. In practice the split produced
+            # confusing "one RRT plan → three episode segments, two of
+            # them dropped as too short" output that hindered debugging.
+            # Now: log the jump at WARNING level so it's visible in the
+            # timeline, but leave the episode intact. One RRT plan = one
+            # recorded episode. If you need the split behavior back, wrap
+            # the log with a `_finish_episode()` / `_recording=True` block
+            # like it used to have.
             new_state = frame.get("observation.state")
             jump_thr = self._context.state_jump_split_threshold_rad
             if self._prev_real_frame_state is not None and new_state is not None and jump_thr > 0:
                 jump = float(np.linalg.norm(new_state - self._prev_real_frame_state))
                 if jump > jump_thr:
-                    logger.info(
-                        "[TeleopRecording] State discontinuity detected "
-                        "(Δs=%.4f rad > threshold %.4f) — finalizing prior "
-                        "episode and starting a fresh one for the post-jump "
-                        "trajectory.",
+                    logger.warning(
+                        "[TeleopRecording] State discontinuity (Δs=%.4f rad > "
+                        "threshold %.4f) DURING episode — likely physics-solver "
+                        "correction from an obstacle-penetrating RRT waypoint. "
+                        "NOT splitting the episode (kept as one). Investigate "
+                        "the plan quality if this fires often.",
                         jump,
                         jump_thr,
                     )
-                    self._finish_episode()
-                    # _finish_episode resets _prev_real_frame_state to None
-                    # and _recording to False. Restore _recording=True for
-                    # the new frame we're about to buffer.
-                    self._recording = True
             self._buffer_frame(frame)
             if new_state is not None:
                 # Anchor for the next tick's discontinuity check. Plain
