@@ -68,6 +68,34 @@ class CheckpointFormat(str, Enum):
     def wants_dcp(self) -> bool:
         """True when sharded DCP model shards (`pytorch_model_fsdp_0/`) should be written."""
         return self in (CheckpointFormat.DCP, CheckpointFormat.SAFETENSORS_AND_DCP)
+def _migrate_legacy_renamed_fields(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Rename fields that were renamed in the TrainPipelineConfig schema after
+    old checkpoints were written. Applied on load so `--resume` from a
+    pre-rename checkpoint still parses under the current class.
+
+    Returns a mutated copy of the config, or None when no legacy field is
+    present (fast-path skip).
+
+    Add entries here whenever an upstream rebase renames a
+    TrainPipelineConfig field — the alternative is asking every user to
+    hand-edit their saved train_config.json before resuming.
+    """
+    renames = {
+        # 2026-07 upstream rename: eval_freq → env_eval_freq (split off from
+        # dataset-eval, which now uses --eval_steps).
+        "eval_freq": "env_eval_freq",
+    }
+    if not any(old in config for old in renames):
+        return None
+    migrated = dict(config)
+    for old, new in renames.items():
+        if old in migrated:
+            # If BOTH old and new are present (weird), prefer new — the config
+            # was already partially migrated somehow; don't clobber the newer
+            # write with the stale field.
+            value = migrated.pop(old)
+            migrated.setdefault(new, value)
+    return migrated
 
 
 def _migrate_legacy_rabc_fields(config: dict[str, Any]) -> dict[str, Any] | None:
@@ -180,6 +208,23 @@ class TrainPipelineConfig(HubMixin):
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+
+    # Slice a subset of last-axis dims out of specific observation feature
+    # tensors before they reach the policy. Use case: an unused/constant
+    # observation dim (e.g., the always-0 gripper joint in the planar_3joint
+    # env) has min == max in the dataset stats, which poisons MIN_MAX
+    # normalization AND wastes an input slot on a dead feature. Dropping the
+    # dim here avoids both without needing to re-record the dataset.
+    #
+    # Format: {observation_key: [dim_indices_to_keep_on_last_axis]}. Empty
+    # dict = disabled. The slice is:
+    #   * applied by SelectObservationDimsProcessorStep (inserted as the
+    #     first preprocessor step in factory.py's post-hoc block),
+    #   * baked into `policy.input_features[key].shape` at validate() time
+    #     so the model input dim matches the sliced tensor.
+    # Example CLI:
+    #   --observation_dim_slice='{"observation.state": [0, 1, 2]}'
+    observation_dim_slice: dict[str, list[int]] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
 
     @property
@@ -284,11 +329,36 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
-        if self.rename_map and active_cfg.pretrained_path is None:
-            raise ValueError(
-                "`rename_map` requires a pretrained policy checkpoint. "
-                "Fresh initialization derives feature names from the current dataset, so no rename is applied."
-            )
+        # Note: upstream also errors here if `rename_map` is set without a
+        # pretrained_path, on the assumption that fresh-init policies derive
+        # feature names from the dataset. That assumption breaks when the
+        # caller manually overrides `policy.input_features` on fresh init —
+        # rename_map then bridges the dataset's raw keys to those overridden
+        # names, and is genuinely load-bearing. train_sweep.sh does this. The
+        # validation is dropped here rather than gated on
+        # `input_features`-being-set because we don't have that field's
+        # provenance handy at this point (draccus doesn't distinguish
+        # "defaulted" from "explicitly set") and rename_map is inert when the
+        # dataset already matches the policy schema.
+
+        # ─── observation_dim_slice → policy.input_features shape ──────────────
+        # Auto-shrink the declared shape of each sliced observation feature so
+        # the model's input dim matches what SelectObservationDimsProcessorStep
+        # will actually emit at runtime (see the field docstring above). Runs
+        # BEFORE the multi-dataset validation block so any downstream shape
+        # checks see the post-slice shape. Only touches keys that ARE in
+        # `policy.input_features` — extra keys in the slice dict are silently
+        # ignored (they may target features the policy doesn't consume).
+        if self.observation_dim_slice and self.policy is not None:
+            for key, idx_list in self.observation_dim_slice.items():
+                feat = (self.policy.input_features or {}).get(key)
+                if feat is None:
+                    continue
+                old_shape = tuple(feat.shape)
+                if not old_shape:
+                    continue
+                new_shape = (*old_shape[:-1], len(idx_list))
+                self.policy.input_features[key] = type(feat)(type=feat.type, shape=new_shape)
 
         if not self.job_name:
             if self.env is None:
@@ -517,7 +587,14 @@ class TrainPipelineConfig(HubMixin):
         if config_file is not None and config_file.endswith(".json"):
             with open(config_file) as f:
                 config = json.load(f)
-            migrated_config = _migrate_legacy_rabc_fields(config)
+            # Chain migrations. Each helper returns None to fast-skip, else a
+            # mutated dict; we thread the mutated dict through the chain so
+            # multiple stale fields in the same checkpoint all get fixed.
+            migrated_config: dict[str, Any] | None = None
+            for migrate in (_migrate_legacy_renamed_fields, _migrate_legacy_rabc_fields):
+                out = migrate(migrated_config if migrated_config is not None else config)
+                if out is not None:
+                    migrated_config = out
             if migrated_config is not None:
                 with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
                     json.dump(migrated_config, f)

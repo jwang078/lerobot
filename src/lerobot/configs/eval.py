@@ -40,6 +40,14 @@ class EvalPipelineConfig:
     seed: int | None = 1000
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Slice a subset of last-axis dims out of specific observation feature
+    # tensors before they reach the policy. Same semantics as
+    # TrainPipelineConfig.observation_dim_slice — used at eval time to match
+    # what the checkpoint was trained with, OR to add the slice against a
+    # checkpoint that predates it (e.g. Round 1 intervention-recording where
+    # the base policy was trained on full obs but the DAgger sweep enabled
+    # the slice for subsequent rounds). Empty dict = disabled.
+    observation_dim_slice: dict[str, list[int]] = field(default_factory=dict)
     # Explicit consent to execute remote code from the Hub (required for hub environments).
     trust_remote_code: bool = False
     # Optional intervention-driven rollout config. None (default) → passive

@@ -88,16 +88,23 @@ def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
 
     Args:
         actions: (B, T, action_dim) or (B, action_dim).
-        state: (B, state_dim). Broadcast across time dimension.
-        mask: Which dims to convert. Can be shorter than action_dim.
+        state: (B, state_dim). Broadcast across time dimension. May be narrower
+            than the action — any action dim beyond state_dim is left absolute
+            automatically (no state reference to subtract from). This makes the
+            step transparent to upstream `SelectObservationDimsProcessorStep`:
+            slicing gripper out of observation.state auto-excludes the gripper
+            action from relativizing without needing an explicit mask entry.
+        mask: Which dims to convert. Can be shorter than action_dim; only the
+            first `min(len(mask), state.shape[-1])` positions are consulted.
     """
     mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
-    # Align state to the same device/dtype as actions. _last_state is cached before
-    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
     if state.device != actions.device or state.dtype != actions.dtype:
         state = state.to(device=actions.device, dtype=actions.dtype)
-    state_offset = state[..., :dims] * mask_t
+    # Effective width = min(mask, state) — state's width is authoritative for
+    # what CAN be relativized (no state = no reference), mask's width is
+    # authoritative for what SHOULD be relativized (config).
+    dims = min(mask_t.shape[0], state.shape[-1])
+    state_offset = state[..., :dims] * mask_t[:dims]
     if actions.ndim == 3:
         state_offset = state_offset.unsqueeze(-2)
     actions = actions.clone()
@@ -110,16 +117,17 @@ def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
 
     Args:
         actions: (B, T, action_dim) or (B, action_dim).
-        state: (B, state_dim). Broadcast across time dimension.
-        mask: Which dims to convert. Can be shorter than action_dim.
+        state: (B, state_dim). Broadcast across time dimension. May be narrower
+            than the action — see `to_relative_actions` for the state-drives-width
+            rationale (must invert consistently).
+        mask: Which dims to convert. Can be shorter than action_dim; only the
+            first `min(len(mask), state.shape[-1])` positions are consulted.
     """
     mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
-    # Align state to the same device/dtype as actions. _last_state is cached before
-    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
     if state.device != actions.device or state.dtype != actions.dtype:
         state = state.to(device=actions.device, dtype=actions.dtype)
-    state_offset = state[..., :dims] * mask_t
+    dims = min(mask_t.shape[0], state.shape[-1])
+    state_offset = state[..., :dims] * mask_t[:dims]
     if actions.ndim == 3:
         state_offset = state_offset.unsqueeze(-2)
     actions = actions.clone()
@@ -279,6 +287,11 @@ class RelativeActionsProcessorStep(ProcessorStep):
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features
+
+
+# Back-compat alias for checkpoints saved before "delta" → "relative" rename.
+# Load-time only; new checkpoints always write the current name.
+ProcessorStepRegistry.register_alias("delta_actions_processor", "relative_actions_processor")
 
 
 @ProcessorStepRegistry.register("absolute_actions_processor")

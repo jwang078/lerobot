@@ -275,7 +275,10 @@ def make_dataloaders(
         dataloader and the eval dataloader (None when no eval split exists).
     """
     active_cfg = cfg.trainable_config
-    if not cfg.dataset.streaming:
+    # Two sampler modes: (1) multi-dataset weighted sampling already set `sampler`
+    # to WeightedRandomSampler above — don't overwrite it; (2) single-dataset
+    # non-streaming uses EpisodeAwareSampler (upstream default).
+    if not cfg.dataset.streaming and sampler is None:
         # All non-streaming (map-style) datasets use EpisodeAwareSampler.
         # The order is a pure function of (seed, epoch), so every rank independently produces the
         # same permutation. accelerate then shards it disjointly across data-parallel ranks via
@@ -531,44 +534,108 @@ def train(cfg: TrainPipelineConfig):
     # single-dataset and multi-dataset modes both flow through this same path.
     renamed_stats = {cfg.rename_map.get(k, k): v for k, v in dataset.meta.stats.items()}
 
+    # observation_dim_slice → shrink the matching stats keys on the last axis
+    # to match what the SelectObservationDimsProcessorStep will emit at
+    # runtime. Without this, the normalizer holds full-width stats (e.g. [4]
+    # for observation.state) but the tensor arriving at normalization time
+    # has been sliced to [3] → shape mismatch on the (tensor - min) subtract.
+    # Applied per stat key (min, max, mean, std, q01, ...); each stat value
+    # is a tensor / ndarray whose last axis is the feature dim.
+    #
+    # Stats may be either torch.Tensor (from dataset.meta.stats natively) OR
+    # numpy.ndarray (when --dataset.stats_path override is loaded via
+    # cast_stats_to_numpy). Handle both — indexing the last axis with a slice
+    # works uniformly across numpy and torch.
+    if cfg.observation_dim_slice:
+        import numpy as _np
+        import torch as _torch
+
+        for _obs_key, _keep_indices in cfg.observation_dim_slice.items():
+            _target_key = cfg.rename_map.get(_obs_key, _obs_key)
+            _feat_stats = renamed_stats.get(_target_key)
+            if _feat_stats is None:
+                continue
+            _keep_list = list(_keep_indices)
+            _max_idx = max(_keep_list)
+            _new_feat_stats = {}
+            for _stat_name, _stat_val in _feat_stats.items():
+                _is_torch = isinstance(_stat_val, _torch.Tensor)
+                _is_numpy = isinstance(_stat_val, _np.ndarray)
+                if (_is_torch or _is_numpy) and _stat_val.ndim >= 1 and _stat_val.shape[-1] > _max_idx:
+                    if _is_torch:
+                        _idx = _torch.as_tensor(_keep_list, dtype=_torch.long, device=_stat_val.device)
+                        _new_feat_stats[_stat_name] = _stat_val.index_select(dim=-1, index=_idx)
+                    else:
+                        _new_feat_stats[_stat_name] = _stat_val[..., _keep_list]
+                else:
+                    # Scalar stats (e.g. count) or per-pixel image stats — pass through.
+                    _new_feat_stats[_stat_name] = _stat_val
+            renamed_stats[_target_key] = _new_feat_stats
+
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = renamed_stats
 
     if cfg.is_reward_model_training:
         processor_kwargs["dataset_meta"] = dataset.meta
-    if not cfg.is_reward_model_training and processor_pretrained_path is not None:
-        preprocessor_overrides = {
-            "device_processor": {"device": device.type},
-            "normalizer_processor": {
+
+    if not cfg.is_reward_model_training:
+        # Preprocessor/postprocessor override delivery differs between the
+        # two paths through make_pre_post_processors (factory.py):
+        #   * Resume path: PolicyProcessorPipeline.from_pretrained applies
+        #     every override key wholesale (factory.py:338).
+        #   * Fresh-init path: only rename_map is fished out and patched
+        #     into the built pipeline post-hoc (factory.py:525-533). All
+        #     other override keys are silently ignored on fresh init — the
+        #     policy-specific factory builds normalizer/relative-actions
+        #     steps from `dataset_stats` (passed separately) and from
+        #     `policy_cfg` fields (`use_relative_actions`) directly.
+        # So the two branches below carry exactly the overrides that
+        # actually reach the pipeline in each mode. Do not add fresh-init
+        # keys that the factory doesn't consume — they'd look like they
+        # do something but don't.
+        preprocessor_overrides: dict[str, Any] = {
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        }
+        postprocessor_overrides: dict[str, Any] = {}
+        if processor_pretrained_path is not None:
+            preprocessor_overrides["device_processor"] = {"device": device.type}
+            preprocessor_overrides["normalizer_processor"] = {
                 "stats": renamed_stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
-            },
-            "rename_observations_processor": {"rename_map": cfg.rename_map},
-        }
-        postprocessor_overrides = {
-            "unnormalizer_processor": {
+            }
+            postprocessor_overrides["unnormalizer_processor"] = {
                 "stats": renamed_stats,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,
-            },
-        }
-        # On resume, the checkpoint's saved processor stats are authoritative: they may have
-        # been adapted by the policy (e.g. EVO1 pads state/action stats to max_state_dim),
-        # and force-feeding raw dataset stats over them crashes normalization (#4006).
-        # This mirrors the `dataset_stats` kwarg above, which is also skipped on resume.
-        if not cfg.resume:
-            preprocessor_overrides["normalizer_processor"]["stats"] = dataset.meta.stats
-            postprocessor_overrides["unnormalizer_processor"]["stats"] = dataset.meta.stats
-        if getattr(active_cfg, "use_relative_actions", False):
-            preprocessor_overrides["relative_actions_processor"] = {
-                "enabled": True,
-                "exclude_joints": getattr(active_cfg, "relative_exclude_joints", []),
-                "action_names": getattr(active_cfg, "action_feature_names", None),
             }
-            postprocessor_overrides["absolute_actions_processor"] = {"enabled": True}
+            if getattr(active_cfg, "use_relative_actions", False):
+                preprocessor_overrides["relative_actions_processor"] = {
+                    "enabled": True,
+                    "exclude_joints": getattr(active_cfg, "relative_exclude_joints", []),
+                    "action_names": getattr(active_cfg, "action_feature_names", None),
+                }
+                postprocessor_overrides["absolute_actions_processor"] = {"enabled": True}
+            # On resume, the checkpoint's saved processor stats are authoritative: they may have
+            # been adapted by the policy (e.g. EVO1 pads state/action stats to max_state_dim),
+            # and force-feeding raw dataset stats over them crashes normalization (#4006).
+            if cfg.resume:
+                preprocessor_overrides["normalizer_processor"].pop("stats", None)
+                postprocessor_overrides["unnormalizer_processor"].pop("stats", None)
         processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
         processor_kwargs["postprocessor_overrides"] = postprocessor_overrides
+        # Observation dim slice: not delivered via preprocessor_overrides
+        # because PolicyProcessorPipeline.from_pretrained validates that
+        # every override key matches an existing saved step — a resume from
+        # a checkpoint that predates this feature has no
+        # `select_observation_dims_processor` in its saved pipeline, so the
+        # override would fail (pipeline.py:_validate_overrides_used).
+        # Instead we route the slice through a top-level kwarg that the
+        # factory's post-hoc block reads, uniformly patching both fresh
+        # init AND resume (inserting the step at position 0 when the saved
+        # pipeline doesn't already carry it).
+        if cfg.observation_dim_slice:
+            processor_kwargs["observation_dim_slice"] = cfg.observation_dim_slice
 
     if cfg.is_reward_model_training:
         preprocessor, postprocessor = make_reward_pre_post_processors(
@@ -741,18 +808,19 @@ def train(cfg: TrainPipelineConfig):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # Multi-dataset weighted sampling: when `sample_weights` is set, build a
-    # WeightedRandomSampler so per-source share is governed by the configured
-    # target weights instead of by the dataset-size ratio (which is what
-    # `shuffle=True` over a ConcatDataset would give you). Each frame in
-    # sub-dataset i gets per-sample weight `sample_weights[i] / size_i`, so the
-    # expected per-batch share matches `sample_weights[i]` exactly.
+    # Multi-dataset weighted sampling: fork-only path. Explicitly gated on
+    # cfg.dataset.use_weighted_sampling (not just `sample_weights is not None`)
+    # so upstream users who happen to set sample_weights don't get silently
+    # swapped onto a different sampler. Requires sample_weights to be set
+    # (validated in DatasetConfig.__post_init__). Each frame in sub-dataset i
+    # gets per-sample weight `sample_weights[i] / size_i`, so the expected
+    # per-batch share matches `sample_weights[i]` exactly.
     # `replacement=True` is required for float weights and is correct semantics:
     # "every batch is X% intervention" is meaningful regardless of how few
     # intervention frames exist on disk.
     sampler = None
     shuffle_arg = not cfg.dataset.streaming
-    if cfg.dataset.sample_weights is not None:
+    if cfg.dataset.use_weighted_sampling:
         per_sample_weights = torch.zeros(len(dataset), dtype=torch.double)
         cumulative_sizes = dataset.cumulative_sizes
         starts = [0, *cumulative_sizes[:-1]]
@@ -874,6 +942,16 @@ def train(cfg: TrainPipelineConfig):
         logging.info(
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
+
+    # Persist the training config BEFORE the loop so an early crash (e.g. during
+    # the first env eval / video save) still leaves a record of exactly how this
+    # run was configured. save_checkpoint() also writes train_config.json, but
+    # only at the first save step — which lands AFTER the first eval, so it's lost
+    # if eval crashes first. This top-level snapshot is idempotent (overwritten by
+    # each checkpoint's copy) and harmless on resume.
+    if is_main_process and cfg.save_checkpoint:
+        cfg.save_pretrained(cfg.output_dir)
+        logging.info(f"Saved pre-training config snapshot: {cfg.output_dir / 'train_config.json'}")
 
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
@@ -1112,6 +1190,14 @@ def train(cfg: TrainPipelineConfig):
 
     if is_main_process():
         progbar.close()
+
+    # Flush wandb BEFORE closing the eval envs: env teardown can SIGABRT
+    # (PyBullet/Tcl), which skips atexit and would drop the still-uncommitted
+    # final-step row (wandb only commits a step's data when a higher step is
+    # logged or the run is finished — neither happens for the last step).
+    if wandb_logger:
+        wandb_logger.finish()
+
         logging.info("End of training")
 
     # --- publish (collective-safe: all ranks; the model commit gathers sharded weights) ---------

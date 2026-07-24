@@ -769,6 +769,13 @@ def eval_policy(
     n_episodes_rendered = 0  # for saving the correct number of videos
     n_failed_rendered = 0  # extra budget for failed-only videos
     any_render_budget = max_episodes_rendered > 0 or max_episodes_rendered_failed > 0
+    # Whether the POLICY consumes image observations. When it does, the env is
+    # already rendering cameras every step, so capturing video frames is cheap and
+    # we keep the original "render every batch, filter afterward" behavior. When it
+    # does NOT (e.g. a state-only oracle policy), the env renders nothing otherwise,
+    # so video frames are pure added cost — we stop rendering as soon as the video
+    # budgets are full (see render_frame).
+    policy_uses_images = bool(getattr(getattr(policy, "config", None), "image_features", None))
 
     # Callback for visualization.
     # Frames must be captured WHILE the rollout runs (we can't go back and
@@ -781,6 +788,19 @@ def eval_policy(
     def render_frame(env: gym.vector.VectorEnv):
         # noqa: B023
         if not any_render_budget:
+            return
+        # Image-free policy: once BOTH budgets are full nothing more will be saved
+        # (the save loop breaks on the same condition), so stop rendering — for a
+        # state-only policy the env renders nothing otherwise, so this avoids
+        # rendering every remaining episode purely to discard it. NOT applied when
+        # the policy uses images: there the cameras run every step regardless, and
+        # we keep the original render-every-batch behavior so failure-video
+        # selection is byte-for-byte unchanged for the existing image pipelines.
+        if (
+            not policy_uses_images
+            and n_episodes_rendered >= max_episodes_rendered
+            and n_failed_rendered >= max_episodes_rendered_failed
+        ):
             return
         # When the failed-video budget is set we need frames for ALL envs
         # in this batch (since any one of them might turn out to be a
@@ -1245,11 +1265,20 @@ def eval_main(cfg: EvalPipelineConfig):
         "rename_observations_processor": {"rename_map": cfg.rename_map},
     }
 
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg.policy,
-        pretrained_path=cfg.policy.pretrained_path,
-        preprocessor_overrides=preprocessor_overrides,
-    )
+    # observation_dim_slice: same delivery convention as lerobot-train — a
+    # top-level kwarg (not a preprocessor_overrides key) because
+    # `PolicyProcessorPipeline.from_pretrained` rejects overrides for steps
+    # that don't exist in the saved config. The factory's post-hoc block
+    # inserts/replaces the step so eval works uniformly whether the
+    # checkpoint was trained with or without the slice.
+    make_pp_kwargs: dict[str, Any] = {
+        "policy_cfg": cfg.policy,
+        "pretrained_path": cfg.policy.pretrained_path,
+        "preprocessor_overrides": preprocessor_overrides,
+    }
+    if cfg.observation_dim_slice:
+        make_pp_kwargs["observation_dim_slice"] = cfg.observation_dim_slice
+    preprocessor, postprocessor = make_pre_post_processors(**make_pp_kwargs)
 
     # Apply temporal-ensembling FIRST (innermost wrapper) so SA, if also enabled,
     # operates on smoothed chunks from TE's predict_action_chunk.
@@ -1333,7 +1362,7 @@ def eval_main(cfg: EvalPipelineConfig):
     # Note: AMP (autocast) is applied only around policy inference, not env operations,
     # because some simulators (e.g., SplatSim with e3nn) don't support half precision.
     # For SplatSim users, keep cfg.policy.use_amp=False so autocast becomes a nullcontext.
-    with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+    with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():  # noqa: F821
         info = eval_policy_all(
             envs=envs,
             policy=policy,

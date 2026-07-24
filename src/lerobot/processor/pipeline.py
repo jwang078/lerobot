@@ -73,6 +73,33 @@ class ProcessorStepRegistry:
     """
 
     _registry: dict[str, type] = {}
+    # Alias map for backward-compat when a processor step is renamed. Reads
+    # like `{old_name: current_name}`. Checked by get() as a fallback after a
+    # direct lookup miss, so aliases don't override live registrations. Populate
+    # via register_alias() near the class you're renaming; unloading a
+    # checkpoint saved before the rename then resolves transparently.
+    _aliases: dict[str, str] = {}
+
+    @classmethod
+    def register_alias(cls, old_name: str, current_name: str) -> None:
+        """Register `old_name` as an alias for an already-registered
+        `current_name`. Idempotent — re-registering the same alias is a no-op.
+
+        Raises:
+            ValueError: If `old_name` collides with a live registration
+                (aliasing would silently override the real class), or if
+                `current_name` isn't registered yet at alias-registration time.
+        """
+        if old_name in cls._registry:
+            raise ValueError(
+                f"Alias '{old_name}' collides with a live registration; unregister "
+                f"the current class first if you actually want to alias it."
+            )
+        if current_name not in cls._registry:
+            raise ValueError(
+                f"Cannot alias '{old_name}' → '{current_name}': '{current_name}' is not registered."
+            )
+        cls._aliases[old_name] = current_name
 
     @classmethod
     def register(cls, name: str | None = None):
@@ -119,6 +146,9 @@ class ProcessorStepRegistry:
             KeyError: If the name is not found in the registry.
         """
         if name not in cls._registry:
+            # Backward-compat alias fallback for renamed steps (see register_alias).
+            if name in cls._aliases:
+                return cls._registry[cls._aliases[name]]
             available = list(cls._registry.keys())
             raise KeyError(
                 f"Processor step '{name}' not found in registry. "
@@ -1032,6 +1062,15 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
             config_filename,
             hub_download_kwargs,
         )
+        # Normalize alias override keys against the saved config's step keys.
+        # When ProcessorStepRegistry.register_alias() has renamed a step, the
+        # SAVED config still keys the step by its OLD name but callers pass
+        # overrides keyed by the CURRENT name (and vice versa on a rollback).
+        # Rewrite override keys to match what's actually in the saved config
+        # so downstream _instantiate_step / _validate_overrides_used both work
+        # without needing to know about aliases.
+        overrides = cls._normalize_override_keys_for_aliases(overrides, loaded_config)
+
         steps, remaining_override_keys = cls._build_steps_from_config(loaded_config, overrides)
 
         for step_instance, step_entry in zip(steps, loaded_config["steps"], strict=True):
@@ -1046,6 +1085,43 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
             )
 
         return steps, remaining_override_keys
+
+    @classmethod
+    def _normalize_override_keys_for_aliases(
+        cls,
+        overrides: dict[str, Any],
+        loaded_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Rewrite override keys through ProcessorStepRegistry._aliases so a
+        checkpoint that saved a step under its old name accepts overrides
+        keyed by the new name (and vice versa).
+
+        Unmatched keys pass through unchanged — validation still catches
+        genuine typos.
+        """
+        if not overrides or not ProcessorStepRegistry._aliases:
+            return overrides
+        saved_keys = {
+            step.get("registry_name") or step["class"].rsplit(".", 1)[1]
+            for step in loaded_config.get("steps", [])
+        }
+        aliases = ProcessorStepRegistry._aliases  # {old_name: current_name}
+        reverse_aliases = {new: old for old, new in aliases.items()}
+        remapped: dict[str, Any] = {}
+        for k, v in overrides.items():
+            if k in saved_keys:
+                remapped[k] = v
+            elif k in reverse_aliases and reverse_aliases[k] in saved_keys:
+                # override uses current name; saved config uses old name.
+                remapped[reverse_aliases[k]] = v
+            elif k in aliases and aliases[k] in saved_keys:
+                # override uses old name; saved config uses current name.
+                remapped[aliases[k]] = v
+            else:
+                # Doesn't match anything — pass through so
+                # _validate_overrides_used surfaces the typo.
+                remapped[k] = v
+        return remapped
 
     @classmethod
     def _resolve_artifact_paths(

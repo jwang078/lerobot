@@ -245,6 +245,42 @@ def make_pre_post_processors(
         dataset_stats=kwargs.get("dataset_stats"),
         dataset_meta=kwargs.get("dataset_meta"),
     )
+    if rename_map:
+        for step in processors[0].steps:
+            if hasattr(step, "rename_map"):
+                step.rename_map = rename_map
+
+    # Apply observation_dim_slice via the SelectObservationDimsProcessorStep.
+    # Delivered as a top-level kwarg (not via preprocessor_overrides) because
+    # PolicyProcessorPipeline.from_pretrained's override validation rejects
+    # unknown keys — a checkpoint predating this feature has no such step in
+    # its saved config. We instead unconditionally insert/replace the step
+    # here so fresh init AND resume both work regardless of the saved
+    # pipeline's contents. `steps` is typed Sequence[ProcessorStep] so we
+    # rebuild + reassign rather than mutate in place.
+    #
+    # Placement: FIRST step. Downstream steps (normalizer, relative-actions)
+    # then see the sliced tensor width and treat the missing dims as
+    # non-existent — no special-case knowledge in either. The upstream
+    # `renamed_stats` in lerobot_train.py is pre-sliced to match, so the
+    # normalizer's stats width lines up with the tensor width. Relative-
+    # actions caps its effective width at `min(mask, state.shape[-1])`, so
+    # any action dim beyond state's width is kept absolute automatically —
+    # the step is transparent to the slice.
+    obs_dim_slice = kwargs.get("observation_dim_slice")
+    if obs_dim_slice:
+        from lerobot.processor.select_observation_dims_processor import (
+            SelectObservationDimsProcessorStep,
+        )
+
+        new_slice_step = SelectObservationDimsProcessorStep(dims=dict(obs_dim_slice))
+        new_steps = [
+            step for step in processors[0].steps if not isinstance(step, SelectObservationDimsProcessorStep)
+        ]
+        new_steps.insert(0, new_slice_step)
+        processors[0].steps = new_steps
+
+    return processors
 
 
 def make_policy(
@@ -557,9 +593,17 @@ def _wrap_with_shared_autonomy(policy, cfg):
         rrt_ik_skip_gripper_obstacle_pairs=sa_cfg.rrt_ik_skip_gripper_obstacle_pairs,
         rrt_escape_clearance_factor=sa_cfg.rrt_escape_clearance_factor,
         rrt_rewind_clearance_factor=sa_cfg.rrt_rewind_clearance_factor,
+        rrt_final_approach_dist=sa_cfg.rrt_final_approach_dist,
+        rrt_final_approach_vel_scale=sa_cfg.rrt_final_approach_vel_scale,
+        rrt_final_approach_acc_scale=sa_cfg.rrt_final_approach_acc_scale,
+        rrt_uniform_path_speed=sa_cfg.rrt_uniform_path_speed,
         rrt_abort_on_drift_rad=sa_cfg.rrt_abort_on_drift_rad,
         rrt_abort_on_drift_ticks=sa_cfg.rrt_abort_on_drift_ticks,
         rrt_drift_trigger=sa_cfg.rrt_drift_trigger,
+        shield_check_every_n_ticks=getattr(sa_cfg, "shield_check_every_n_ticks", 1),
+        debug_shield_force_trigger=getattr(sa_cfg, "debug_shield_force_trigger", False),
+        debug_shield_trace_anchor=getattr(sa_cfg, "debug_shield_trace_anchor", False),
+        debug_rrt_drift_log=getattr(sa_cfg, "debug_rrt_drift_log", False),
     )
 
     # Connect shared context for teleop recording (if active)
