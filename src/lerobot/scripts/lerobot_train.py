@@ -811,16 +811,29 @@ def train(cfg: TrainPipelineConfig):
             exclude_features=_bench_excl or None,
         )
         _bench_collate = lerobot_collate_fn if dataset.meta.has_language_columns else None
+        # Deliberately NOT cfg.num_workers, and NOT persistent.
+        #
+        # This loader does a short burst of work (<= eval_benchmark_loss_max_batches)
+        # once every eval_benchmark_loss_freq steps — typically minutes apart. Sized
+        # like the train loader it would hold a SECOND full worker pool alive for the
+        # entire run: with the `spawn` start method each worker re-imports torch and
+        # reloads dataset metadata, so they cost ~1.5 GB EACH and never release it.
+        # That is what OOM-killed a 30 GB box (15 live workers, ~23.7 GB, while the
+        # benchmark pool sat idle >95% of the time).
+        #
+        # A small non-persistent pool pays a few seconds of worker startup per eval
+        # instead — irrelevant next to the eval interval — and gives the memory back.
+        _bench_workers = min(cfg.num_workers, 2)
         eval_benchmark_dataloader = torch.utils.data.DataLoader(
             _bench_ds,
             batch_size=cfg.batch_size,
             shuffle=False,
-            num_workers=cfg.num_workers,
+            num_workers=_bench_workers,
             pin_memory=device.type == "cuda",
             drop_last=False,
             collate_fn=_bench_collate,
-            prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
-            persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+            prefetch_factor=cfg.prefetch_factor if _bench_workers > 0 else None,
+            persistent_workers=False,
         )
     elif cfg.eval_benchmark_loss_freq > 0 and is_main_process:
         logging.warning(
