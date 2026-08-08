@@ -98,3 +98,14 @@ Traps that cost real time here:
   `src/lerobot/configs/train.py` — add an entry there so old checkpoints still
   `--resume`, instead of hand-editing saved `train_config.json` files.
 - **Pushing after a rebase needs `--force-with-lease`** (history is rewritten).
+- **Dependency drift is invisible until it isn't.** Newer upstream can require
+  newer deps than your env has, and neither git nor an import check notices.
+  It surfaces as one specific call failing — e.g. `draccus` 0.10 vs the required
+  `>=0.11.6` trained fine and then died at the FIRST CHECKPOINT with
+  `encode() takes 1 positional argument but 2 were given`. `sync_upstream.sh`
+  now diffs installed versions against `pyproject.toml` at the end of a sync.
+- **`git rebase` does NOT run pre-commit.** Replayed commits are never linted,
+  so a bad conflict resolution can drop an import and stay invisible until that
+  code path runs. After a sync, run
+  `pre-commit run ruff --files <changed src files>` and look for
+  `F821 Undefined name`.
