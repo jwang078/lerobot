@@ -484,14 +484,6 @@ def train(cfg: TrainPipelineConfig):
         logging.info(f"Overriding dataset stats from {stats_path}")
         dataset.meta.stats = cast_stats_to_numpy(load_json(stats_path))
 
-    # Create environment used for evaluating checkpoints during training on simulation data.
-    # On real-world data, no need to create an environment as evaluations are done outside train.py,
-    # using the eval.py instead, with gym_dora environment and dora-rs.
-    eval_env = None
-    if cfg.env_eval_freq > 0 and cfg.env is not None and is_main_process:
-        logging.info("Creating env")
-        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
-
     # --- policy (weight source decided by the resume rule) -------------------------------------
     # On resume, cfg was parsed FROM the checkpoint's train_config.json, so cfg.checkpoint_format
     # IS the recorded value: DCP-bearing formats skip the safetensors load here and stream the
