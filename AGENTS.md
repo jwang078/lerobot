@@ -70,3 +70,31 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **DAgger config sidecar**: `dagger_orchestrate.sh` writes `<train_dir>/dagger/config.json` at the top of every per-round loop iteration AND the post-loop scratch step. JSON captures orchestrator argv, computed naming (including `naming.base_repo`, the resolved base-dataset repo id), rerun-mode source pointers (`source_run_tag`, `source_blends_tag`, `source_policy_basename`, `source_int_short_prefix`, `branching_policy_path`) when in rerun mode (null otherwise). `dagger_plot.py` reads these sidecars to auto-pair rerun lineages with their source and emit per-metric overlay comparison plots under `outputs/dagger/comparison_<source_lineage>/{succ,pos_err,ori_err,in_coll,trunc}.png`. Existing pre-sidecar reruns can be retroactively annotated via `my_scripts/dagger_retrofit_rerun_sidecar.sh`.
 - **DAgger naming module**: `my_scripts/dagger_naming.py` is the canonical source of truth for DAgger artifact names — owns both forward derivation (config → name: `int_short`, `blend_short`, `blend_tag_for_ratio`, `format_blends_tag`, `derive_base_dataset_short`, `derive_base_policy_name`, ...) and inverse parsing (name → config: `parse_dataset_short`, `lineage_of`, `ratio_for_blend_tag`). Bash callers (`dagger_orchestrate.sh`, `dagger_orchestrate_sweep.sh`, `dagger_cleanup_lineage.sh`) shell out via the `_py_dagger_name <subcommand>` shim (`python3 my_scripts/dagger_naming.py ...`) so the two languages can't drift. Sidecar inspection helpers (`find_sidecar_by_prefix`, `load_sidecar`, `resolve_base_repo`, `enumerate_blend_paths_on_disk`) are also here. New DAgger scripts should import from this module — do not duplicate naming logic.
 - **DAgger state-coverage PCA**: `my_scripts/dagger_state_coverage_pca.py` projects `observation.state` joint angles from {base + intervention + all on-disk blends} for a single round into a shared 2D PCA basis and scatter-plots them with one color per source (rainbow by blend ratio matching `dagger_plot.py`). Tests the "state distribution interpolation" justification for blending: blends should fill the gap between base and pure intervention. Takes ANY dataset path in the lineage (`--dataset_path=...`) + a round override (`--round=N`); auto-resolves siblings via `dagger_naming.parse_dataset_short` + sidecar lookup. Uses `load_state_episodes` from `plot_state_deltas.py` for parquet-only loading (no video decode). Output: `outputs/dagger/state_coverage/<prefix>_dag<R>_state_coverage_pca.png`.
+
+## Syncing with upstream LeRobot
+
+This is a fork of `huggingface/lerobot`. Use `./my_scripts/sync_upstream.sh`
+(`--check` to preview divergence without changing anything) rather than a bare
+`git pull --rebase`. It enables `rerere`, snapshots the branch to a `backup/…`
+ref first, and runs a post-rebase verification pass.
+
+Two things keep this cheap:
+
+- **Sync often.** The conflict surface scales with drift. The first sync after
+  ~6 months replayed 80 commits against 30 co-touched files.
+- **Keep fork code out of upstream files.** Anything under `my_scripts/` never
+  conflicts. Edits inside `src/lerobot/**` do.
+
+Traps that cost real time here:
+
+- **Auto-merged files can still be broken.** Upstream renames modules
+  (`lerobot.types` → `lerobot.lerobot_types`) and factors functions out of
+  `train()`. Those files merge without a conflict and then fail at import, or
+  leave a block orphaned in the wrong scope. Always run the script's verify pass.
+- **Duplicate blocks are the most common bad resolution.** When your side of a
+  conflict re-adds code that already exists just below it, take upstream's
+  (often empty) side.
+- **Config field renames** are absorbed by `_migrate_legacy_renamed_fields` in
+  `src/lerobot/configs/train.py` — add an entry there so old checkpoints still
+  `--resume`, instead of hand-editing saved `train_config.json` files.
+- **Pushing after a rebase needs `--force-with-lease`** (history is rewritten).
