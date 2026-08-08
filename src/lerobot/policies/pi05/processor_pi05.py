@@ -25,6 +25,8 @@ from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
+    DeviceProcessorStep,
+    NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
@@ -33,6 +35,8 @@ from lerobot.processor import (
     TokenizerProcessorStep,
     make_default_policy_processor_steps,
     make_policy_processor_pipelines,
+    policy_action_to_transition,
+    transition_to_policy_action,
 )
 from lerobot.utils.constants import OBS_STATE
 
@@ -158,9 +162,7 @@ def make_pi05_pre_post_processors(
 def make_pi05_inverse_post_processor(
     config: PI05Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-) -> tuple[
-    PolicyProcessorPipeline[PolicyAction, PolicyAction],
-]:
+) -> tuple[PolicyProcessorPipeline[PolicyAction, PolicyAction],]:
     """
     Constructs the inverse post-processor pipeline for PI0.5.
 

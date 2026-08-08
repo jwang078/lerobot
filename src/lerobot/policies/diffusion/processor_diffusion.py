@@ -28,9 +28,12 @@ from lerobot.processor import (
     RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     UnnormalizerProcessorStep,
-    make_default_pre_post_processors,
     policy_action_to_transition,
     transition_to_policy_action,
+)
+from lerobot.utils.constants import (
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
 from .configuration_diffusion import DiffusionConfig

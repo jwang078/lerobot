@@ -22,10 +22,9 @@ denoising loop (with its real-time-chunking hook) that the openpi-derived polici
 stateless; adopting them does not affect checkpoints.
 """
 
+import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING
-
-import math
 
 import torch
 from torch import Tensor

@@ -240,11 +240,18 @@ def make_pre_post_processors(
 
     # Create new processors from the policy config, resolving the per-policy factory
     # function by naming convention (lazy import keeps optional dependencies optional).
-    return _make_processors_from_policy_config(
+    processors = _make_processors_from_policy_config(
         config=policy_cfg,
         dataset_stats=kwargs.get("dataset_stats"),
         dataset_meta=kwargs.get("dataset_meta"),
     )
+
+    # Fresh-init path: the per-policy factory builds the pipeline from the config
+    # alone, so rename_map / observation_dim_slice have to be patched in here
+    # (the resume path applies them via preprocessor_overrides instead).
+    rename_map = kwargs.get("preprocessor_overrides", {}).get("rename_observations_processor", {}).get(
+        "rename_map"
+    ) or kwargs.get("rename_map")
     if rename_map:
         for step in processors[0].steps:
             if hasattr(step, "rename_map"):
