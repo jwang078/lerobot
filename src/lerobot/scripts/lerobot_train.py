@@ -54,7 +54,6 @@ from lerobot.common.train_utils import (
     resume_after_prepare,
     resume_before_prepare,
     save_checkpoint,
-    should_save_checkpoint,
     update_last_checkpoint,
 )
 from lerobot.common.wandb_utils import WandBLogger
@@ -62,6 +61,7 @@ from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
+from lerobot.datasets.io_utils import cast_stats_to_numpy
 from lerobot.distributed import (
     ParallelDims,
     finalize_sharded_policy,
@@ -69,7 +69,6 @@ from lerobot.distributed import (
     make_accelerator,
     set_fsdp_wrap_modules,
 )
-from lerobot.datasets.io_utils import cast_stats_to_numpy
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -275,9 +274,33 @@ def make_dataloaders(
         dataloader and the eval dataloader (None when no eval split exists).
     """
     active_cfg = cfg.trainable_config
-    # Two sampler modes: (1) multi-dataset weighted sampling already set `sampler`
-    # to WeightedRandomSampler above — don't overwrite it; (2) single-dataset
-    # non-streaming uses EpisodeAwareSampler (upstream default).
+
+    # Multi-dataset weighted sampling: when `sample_weights` is set, per-source share is
+    # governed by the configured target weights instead of the dataset-size ratio. Each frame
+    # in sub-dataset i gets weight `sample_weights[i] / size_i`, so the expected per-batch
+    # share matches `sample_weights[i]`. `replacement=True` is required for float weights and
+    # is the intended semantics ("every batch is X% intervention", however few frames exist).
+    sampler = None
+    if cfg.dataset.sample_weights is not None:
+        per_sample_weights = torch.zeros(len(dataset), dtype=torch.double)
+        cumulative_sizes = dataset.cumulative_sizes
+        starts = [0, *cumulative_sizes[:-1]]
+        for i, (start, end) in enumerate(zip(starts, cumulative_sizes, strict=True)):
+            per_sample_weights[start:end] = cfg.dataset.sample_weights[i] / (end - start)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=per_sample_weights, num_samples=len(dataset), replacement=True
+        )
+        if is_main_process():
+            logging.info(
+                "Multi-dataset weighted sampling enabled: per-source weights=%s, sub-dataset sizes=%s",
+                cfg.dataset.sample_weights,
+                [end - start for start, end in zip(starts, cumulative_sizes, strict=True)],
+            )
+
+    # Two sampler modes: (1) weighted sampling already set `sampler` above — don't overwrite
+    # it (a ConcatDataset exposes no per-episode indices for EpisodeAwareSampler anyway, and
+    # per-source proportions are the whole point); (2) single-dataset non-streaming uses
+    # EpisodeAwareSampler (upstream default).
     if not cfg.dataset.streaming and sampler is None:
         # All non-streaming (map-style) datasets use EpisodeAwareSampler.
         # The order is a pure function of (seed, epoch), so every rank independently produces the
@@ -324,8 +347,7 @@ def make_dataloaders(
                     f"sample {sampler_state['start_index']}"
                 )
     else:
-        shuffle = True
-        sampler = None
+        shuffle = sampler is None
 
     device_type = parallel_dims.device_type
     # Only swap in the language-aware collate when the dataset actually
@@ -743,6 +765,69 @@ def train(cfg: TrainPipelineConfig):
 
     dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, step, parallel_dims)
 
+    # Build a held-out-benchmark loss dataloader when configured. Uses the
+    # SAME dataset the env-eval rolls out on (cfg.env.eval_benchmark_repo_id),
+    # loaded as a LeRobotDataset with the same delta_timestamps the policy
+    # was built with — so the batch shape matches what policy.forward expects.
+    # This gives a per-frame LOSS on truly unseen scenarios (the benchmark is
+    # a distinct dataset, unlike `eval_dataloader` which slices out episodes
+    # from the training dataset). Logged as `eval_benchmark/loss` in wandb.
+    # Silently no-op when the flag is disabled OR when no benchmark repo is
+    # configured — safe to enable in shared training configs.
+    eval_benchmark_dataloader = None
+    _benchmark_repo = getattr(cfg.env, "eval_benchmark_repo_id", None) if cfg.env is not None else None
+    if cfg.eval_benchmark_loss_freq > 0 and _benchmark_repo:
+        if is_main_process:
+            logging.info(
+                f"[eval_benchmark_loss] enabling periodic loss on {_benchmark_repo} "
+                f"every {cfg.eval_benchmark_loss_freq} steps "
+                f"(max_batches={cfg.eval_benchmark_loss_max_batches or 'all'})"
+            )
+        # Reuse the same delta_timestamps the training dataset resolved with
+        # so the returned batch shape matches what the policy consumes.
+        from lerobot.datasets.factory import (
+            resolve_delta_timestamps as _resolve_dt,
+            unconsumed_camera_keys as _unconsumed_cams,
+        )
+        from lerobot.datasets.lerobot_dataset import (
+            LeRobotDataset as _BenchDataset,
+            LeRobotDatasetMetadata as _BenchMeta,
+        )
+
+        # Narrowing for pyright: eval_benchmark_loss_freq > 0 branch cannot
+        # reach here without cfg.policy set (make_train_eval_datasets earlier
+        # required it) and `dataset` bound.
+        assert cfg.policy is not None
+        # Same unconsumed-camera exclusion as make_dataset: benchmark repos in
+        # image-mode (camera frames embedded in parquet rows) would otherwise
+        # pay full per-row PNG materialization for tensors the loss never uses.
+        _bench_meta = _BenchMeta(_benchmark_repo)
+        _bench_excl = _unconsumed_cams(cfg.policy, _bench_meta, getattr(cfg, "rename_map", None))
+        if _bench_excl and is_main_process:
+            logging.info(f"[eval_benchmark_loss] excluding unconsumed camera feature(s): {_bench_excl}")
+        _bench_ds = _BenchDataset(
+            _benchmark_repo,
+            delta_timestamps=_resolve_dt(cfg.policy, dataset.meta, exclude_keys=set(_bench_excl) or None),
+            exclude_features=_bench_excl or None,
+        )
+        _bench_collate = lerobot_collate_fn if dataset.meta.has_language_columns else None
+        eval_benchmark_dataloader = torch.utils.data.DataLoader(
+            _bench_ds,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            collate_fn=_bench_collate,
+            prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+            persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+        )
+    elif cfg.eval_benchmark_loss_freq > 0 and is_main_process:
+        logging.warning(
+            "[eval_benchmark_loss] eval_benchmark_loss_freq > 0 but env.eval_benchmark_repo_id "
+            "is not set — skipping."
+        )
+
     # --- prepare & resume phase 2 ---------------------------------------------------------------
     # The FSDP wrap-unit class names resolve right before prepare: user override, else the
     # policy's _fsdp_wrap_modules declaration — root-only wrapping is never silently accepted.
@@ -818,26 +903,6 @@ def train(cfg: TrainPipelineConfig):
     # `replacement=True` is required for float weights and is correct semantics:
     # "every batch is X% intervention" is meaningful regardless of how few
     # intervention frames exist on disk.
-    sampler = None
-    shuffle_arg = not cfg.dataset.streaming
-    if cfg.dataset.use_weighted_sampling:
-        per_sample_weights = torch.zeros(len(dataset), dtype=torch.double)
-        cumulative_sizes = dataset.cumulative_sizes
-        starts = [0, *cumulative_sizes[:-1]]
-        for i, (start, end) in enumerate(zip(starts, cumulative_sizes, strict=True)):
-            per_sample_weights[start:end] = cfg.dataset.sample_weights[i] / (end - start)
-        sampler = torch.utils.data.WeightedRandomSampler(
-            weights=per_sample_weights,
-            num_samples=len(dataset),
-            replacement=True,
-        )
-        shuffle_arg = False  # DataLoader gates on sampler XOR shuffle
-        if is_main_process:
-            logging.info(
-                "Multi-dataset weighted sampling enabled: per-source weights=%s, sub-dataset sizes=%s",
-                cfg.dataset.sample_weights,
-                [end - start for start, end in zip(starts, cumulative_sizes, strict=True)],
-            )
 
     dl_iter = cycle(dataloader)
     policy.train()

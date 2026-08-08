@@ -28,7 +28,7 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from torch import Tensor
 
 from lerobot.configs import FeatureType, PolicyFeature
-from lerobot.types import RobotObservation
+from lerobot.lerobot_types import RobotObservation
 from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGE, OBS_IMAGES, OBS_STATE, OBS_STR
 from lerobot.utils.utils import get_channel_first_image_shape
 
