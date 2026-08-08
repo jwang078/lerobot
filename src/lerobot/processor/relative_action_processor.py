@@ -30,7 +30,7 @@ from .pipeline import ProcessorStep, ProcessorStepRegistry
 
 # CSV logging for debugging anchor / rel-action desync at inference time.
 # Activate by setting LEROBOT_REL_ACTION_DEBUG_LOG=/path/to/file.csv before running eval.
-# Each call to the relative or absolute processor appends one row.
+# Each call to the relative processor appends one row.
 _DEBUG_LOG_PATH = os.environ.get("LEROBOT_REL_ACTION_DEBUG_LOG")
 _DEBUG_LOG_FILE: Any = None
 _DEBUG_LOG_INIT = False
@@ -44,9 +44,7 @@ def _debug_log(event: str, **fields: Any) -> None:
     if not _DEBUG_LOG_INIT:
         os.makedirs(os.path.dirname(_DEBUG_LOG_PATH) or ".", exist_ok=True)
         _DEBUG_LOG_FILE = open(_DEBUG_LOG_PATH, "w", buffering=1)  # noqa: SIM115 - long-lived log handle, closed by process exit
-        _DEBUG_LOG_FILE.write(
-            "ts,event,state,anchor,rel_action,abs_action,queue_empty,has_action,did_cache_update\n"
-        )
+        _DEBUG_LOG_FILE.write("ts,event,state,anchor,queue_empty,has_action,did_cache_update\n")
         _DEBUG_LOG_INIT = True
 
     def _fmt(v):
@@ -63,8 +61,6 @@ def _debug_log(event: str, **fields: Any) -> None:
         event,
         _fmt(fields.get("state")),
         _fmt(fields.get("anchor")),
-        _fmt(fields.get("rel_action")),
-        _fmt(fields.get("abs_action")),
         _fmt(fields.get("queue_empty")),
         _fmt(fields.get("has_action")),
         _fmt(fields.get("did_cache_update")),
@@ -156,6 +152,10 @@ class RelativeActionsProcessorStep(ProcessorStep):
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
+    # Most recent state seen by __call__ regardless of queue phase — the
+    # candidate _last_state WOULD have been set to if a chunk regen happened
+    # this tick. Consumed by refresh_anchor().
+    _latest_obs_state: torch.Tensor | None = field(default=None, init=False, repr=False)
     # Optional reference to the policy running inference. Used to detect chunk
     # boundaries (via the policy's action queue) so the cached anchor state is
     # only refreshed when a fresh chunk is about to be predicted. Not serialized.
@@ -240,6 +240,12 @@ class RelativeActionsProcessorStep(ProcessorStep):
         did_cache_update = state is not None and (has_action or queue_empty)
         if did_cache_update:
             self._last_state = state
+        # Unconditionally remember the most recent observed state so
+        # refresh_anchor() can re-anchor mid-chunk. NOT the same as
+        # _last_state: this one updates every call, _last_state only at
+        # chunk boundaries (see comment above).
+        if state is not None:
+            self._latest_obs_state = state
 
         # Log every preprocessor call so we can audit cache-update timing vs the
         # state the model is conditioning on this same call.
@@ -272,6 +278,29 @@ class RelativeActionsProcessorStep(ProcessorStep):
         new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)
         return new_transition
 
+    def refresh_anchor(self) -> bool:
+        """Force the decode anchor to the most recently observed state.
+
+        For callers that regenerate an action chunk OUTSIDE the inner
+        policy's queue-empty cadence — e.g. the SA wrapper's obs-teleop
+        blending in ``BlendMode.EVERY_STEP``, which rebuilds a chunk every
+        tick via ``predict_action_chunk``. Those chunks carry deltas
+        anchored at the CURRENT state, but ``_last_state`` (what the paired
+        AbsoluteActionsProcessorStep adds back) only refreshes when the
+        inner queue empties (every n_action_steps ticks) — decoding a
+        current-anchored delta with a stale anchor displaces the target
+        backwards by however far the robot moved since the last refresh,
+        which reads as the robot "shaking backwards" (worst at high blend
+        ratios where the chunk is mostly policy-anchored; guidance-heavy
+        blends cancel the stale anchor because guidance is ENCODED with the
+        same _last_state). Calling this at chunk-rebuild time re-anchors
+        encode and decode consistently. Returns True if an anchor was set.
+        """
+        if self._latest_obs_state is not None:
+            self._last_state = self._latest_obs_state
+            return True
+        return False
+
     def get_cached_state(self) -> torch.Tensor | None:
         """Return the cached ``observation.state`` used as the reference point for relative/absolute action conversions."""
         return self._last_state
@@ -297,7 +326,8 @@ ProcessorStepRegistry.register_alias("delta_actions_processor", "relative_action
 @ProcessorStepRegistry.register("absolute_actions_processor")
 @dataclass
 class AbsoluteActionsProcessorStep(ProcessorStep):
-    """Converts relative actions back to absolute actions (action += state) for all dimensions.
+    """Converts relative actions back to absolute actions (action += state) for the same
+    masked dimensions as the paired RelativeActionsProcessorStep.
 
     Mirrors OpenPI's AbsoluteActions transform. Applied during postprocessing so
     predicted relative offsets are converted back to absolute positions for execution.

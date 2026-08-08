@@ -953,6 +953,15 @@ def train(cfg: TrainPipelineConfig):
         cfg.save_pretrained(cfg.output_dir)
         logging.info(f"Saved pre-training config snapshot: {cfg.output_dir / 'train_config.json'}")
 
+    # Cache the observation-noise config once (dict lookups per-step are fine
+    # but the None check should skip the whole inner loop). Only applied to
+    # the TRAINING loop's batches — the eval-loss branch below deliberately
+    # doesn't inject noise so eval-loss numbers reflect the clean data
+    # distribution and stay comparable step-over-step.
+    _obs_noise_std = cfg.dataset.observation_noise_std
+    if _obs_noise_std and is_main_process:
+        logging.info(f"[train] observation noise enabled: {_obs_noise_std}")
+
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
         batch = next(dl_iter)
@@ -961,6 +970,22 @@ def train(cfg: TrainPipelineConfig):
         for cam_key in dataset.meta.camera_keys:
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+        # Per-key Gaussian noise on observation features — TRAIN-TIME ONLY.
+        # Applied BEFORE the preprocessor so the noise σ is in raw feature
+        # units (rad / meters), matching the units the user configures. The
+        # preprocessor's normalizer then treats noisy inputs the same as
+        # clean ones. Skipped when the key isn't in `batch` (e.g. an image
+        # policy that doesn't consume env_state) so misconfigured keys are
+        # a silent no-op rather than a KeyError mid-training.
+        if _obs_noise_std:
+            for _k, _s in _obs_noise_std.items():
+                if (
+                    _s > 0
+                    and _k in batch
+                    and isinstance(batch[_k], torch.Tensor)
+                    and batch[_k].dtype.is_floating_point
+                ):
+                    batch[_k] = batch[_k] + torch.randn_like(batch[_k]) * _s
         batch = preprocessor(batch)
         train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start
 
@@ -989,14 +1014,15 @@ def train(cfg: TrainPipelineConfig):
             progbar.update(1)
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-        is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
-        # env_eval_freq / eval_steps are applied RELATIVE to the start of this
-        # training run (initial_step_this_run), not to the global step counter.
-        # Fires every freq local steps AND unconditionally at cfg.steps (mirrors
-        # save behavior). Without this, a resume of N steps with freq=N would
-        # fire mid-run at whichever multiple of freq happens to land inside
-        # the run, and skip the end.
+        # save_freq / env_eval_freq / eval_steps are applied RELATIVE to the
+        # start of this training run (initial_step_this_run), not to the global
+        # step counter. Fires every freq local steps AND unconditionally at
+        # cfg.steps. Without this, a resume of N steps with freq=N would fire
+        # mid-run at whichever multiple of freq happens to land inside the run
+        # (e.g. a 75000->85000 finetune with save_freq=10000 saved at 80000
+        # AND 85000), and skip the end.
         _local_step = step - initial_step_this_run
+        is_saving_step = (_local_step > 0 and _local_step % cfg.save_freq == 0) or step == cfg.steps
         is_env_eval_step = cfg.env_eval_freq > 0 and (
             (_local_step > 0 and _local_step % cfg.env_eval_freq == 0) or step == cfg.steps
         )
@@ -1004,6 +1030,11 @@ def train(cfg: TrainPipelineConfig):
             cfg.eval_steps > 0
             and eval_dataloader is not None
             and ((_local_step > 0 and _local_step % cfg.eval_steps == 0) or step == cfg.steps)
+        )
+        is_eval_benchmark_step = (
+            cfg.eval_benchmark_loss_freq > 0
+            and eval_benchmark_dataloader is not None
+            and ((_local_step > 0 and _local_step % cfg.eval_benchmark_loss_freq == 0) or step == cfg.steps)
         )
 
         if is_log_step:
@@ -1050,6 +1081,42 @@ def train(cfg: TrainPipelineConfig):
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+
+        if is_eval_benchmark_step:
+            # Held-out-benchmark loss on the SAME dataset env-eval rolls out on.
+            # Mirrors the is_eval_step branch above but the underlying dataset
+            # is a distinct benchmark (never in training), so this loss is a
+            # direct overfitting diagnostic vs train/loss. NO observation
+            # noise is added here — we want the clean data-distribution loss
+            # for a stable step-over-step comparison. `eval_benchmark_loss_max_batches`
+            # bounds the periodic cost when the benchmark is large.
+            policy.eval()
+            _bench_loss_sum = 0.0
+            _n_bench_batches = 0
+            _max_batches = cfg.eval_benchmark_loss_max_batches or float("inf")
+            with torch.no_grad(), accelerator.autocast():
+                for bench_batch in eval_benchmark_dataloader:
+                    if _n_bench_batches >= _max_batches:
+                        break
+                    for cam_key in dataset.meta.camera_keys:
+                        if cam_key in bench_batch and bench_batch[cam_key].dtype == torch.uint8:
+                            bench_batch[cam_key] = bench_batch[cam_key].to(dtype=torch.float32) / 255.0
+                    bench_batch = preprocessor(bench_batch)
+                    loss, _ = policy.forward(bench_batch)
+                    _bench_loss_sum += loss.item()
+                    _n_bench_batches += 1
+            _bench_loss = _bench_loss_sum / max(_n_bench_batches, 1)
+            _bench_loss = torch.tensor(_bench_loss, device=device)
+            _bench_loss = accelerator.reduce(_bench_loss, reduction="mean").item()
+            policy.train()
+
+            if is_main_process:
+                logging.info(
+                    f"step {step}: eval_benchmark/loss={_bench_loss:.6f} "
+                    f"(over {_n_bench_batches} batches of {_benchmark_repo})"
+                )
+                if wandb_logger:
+                    wandb_logger.log_dict({"eval_benchmark/loss": _bench_loss}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file

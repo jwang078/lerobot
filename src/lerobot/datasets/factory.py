@@ -134,7 +134,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             )
         delta_timestamps = resolve_delta_timestamps(
             cfg.trainable_config, ds_meta, exclude_keys=set(excluded_image_keys) or None
-        delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta)
+        )
         episodes = resolve_episode_indices(
             cfg.dataset.episodes, ds_meta.total_episodes, cfg.dataset.exclude_episodes
         )

@@ -51,6 +51,18 @@ class InterventionConfig:
     # subsequent trigger. Set min == max to disable randomization.
     policy_steps_between_rrt_min: int = 80
     policy_steps_between_rrt_max: int = 120
+    # When True, SCHEDULED cadence triggers ("time stall": the
+    # policy_steps_before/between_rrt budget elapsing, NOT an actual stall)
+    # take the no-lookback path: RRT plans from the LIVE state with ruckig
+    # seeded from the robot's recent velocity, so the recorded correction
+    # starts velocity-continuous (decelerate-and-redirect) instead of the
+    # rewind+teleport+cold-start of the lookback path. The scheduled trigger
+    # fires mid-healthy-motion, where the rewind serves no purpose — it only
+    # erases the moving-handoff supervision. Genuine stalls
+    # (joint_stall / no_progress*) still rewind: the robot is at rest there,
+    # so there is no velocity to preserve and rewinding to a pre-mistake
+    # state is the desired semantics. Default False = historical behavior.
+    scheduled_trigger_no_lookback: bool = False
     # Random number of waypoints to play back per intervention cycle, drawn
     # from [rrt_steps_min, rrt_steps_max]. After this many steps the
     # controller auto-cancels and hands control back to the policy.
@@ -136,3 +148,27 @@ class InterventionConfig:
     # slow frame).
     stuck_threshold_rad_per_tick: float = 0.005
     stuck_consecutive_ticks: int = 3
+
+    # Joint-stall trigger: fires an intervention when the robot's joint state
+    # has barely moved for `joint_stall_window_steps` consecutive policy-mode
+    # ticks (per-tick joint-L2 |Δstate| < joint_stall_threshold_rad). Purely
+    # kinematic — no reference to goal / EE distance — so it fires even when
+    # the policy legitimately needs to move AWAY from the goal to find a valid
+    # path around an obstacle. Complements the goal-relative no-progress
+    # trigger (which is disabled by default; window=0).
+    #
+    # Fires on POLICY mode only (mode == IDLE). During RRT execution the
+    # counter is reset — Ruckig's smooth deceleration near a waypoint would
+    # otherwise misfire.
+    #
+    # Uses its own threshold (not stuck_threshold_rad_per_tick) so the wedge
+    # gate and the stall trigger can be tuned independently — the wedge gate
+    # cares about "not moving under command", stall cares about "policy
+    # produces the same joint config forever".
+    #
+    # Disabled by default (window=0). Recommended starting values when
+    # enabling: window=60 (≈2 s at 30 Hz — long enough to let Ruckig's
+    # goal-tail deceleration and momentary pauses pass without misfiring),
+    # threshold=0.005 rad/tick (same magnitude as the wedge gate default).
+    joint_stall_window_steps: int = 0
+    joint_stall_threshold_rad: float = 0.005

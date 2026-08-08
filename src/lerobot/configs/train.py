@@ -175,6 +175,22 @@ class TrainPipelineConfig(HubMixin):
     eval_steps: int = 0
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
     max_eval_samples: int = 0
+    # Compute policy loss on the FULL held-out eval-benchmark dataset (the same
+    # one env-eval rolls out on, via cfg.env.eval_benchmark_repo_id) every N
+    # steps. 0 = disabled. Distinct from `eval_steps` which uses a held-out
+    # SLICE of the training dataset via `dataset.eval_split`. This runs on an
+    # ENTIRELY UNSEEN dataset, so its loss vs train/loss is a direct
+    # overfitting diagnostic (typical ratio 1-3× for well-trained models;
+    # 10-30× indicates severe overfitting). Logged to wandb as
+    # `eval_benchmark/loss`. NOTE: requires env.eval_benchmark_repo_id to be
+    # set — silently no-ops otherwise, so it's safe to enable unconditionally
+    # in shared training configs.
+    eval_benchmark_loss_freq: int = 0
+    # Max number of batches to iterate for eval_benchmark_loss (0 = use the
+    # whole benchmark). Set >0 to bound the periodic cost when the benchmark
+    # is large — 32 batches × batch_size 32 ≈ 1000 frames is usually enough
+    # to get a stable mean loss estimate (±5% relative error).
+    eval_benchmark_loss_max_batches: int = 0
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.

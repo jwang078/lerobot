@@ -712,6 +712,29 @@ class SplatSimEnv(EnvConfig):
     # Wired by `dagger_orchestrate.sh --headless` for fast batch runs.
     headless: bool = False
 
+    # When True (paired with `headless`), the in-process robot server still
+    # launches its Tkinter "SplatSim Controls" panel: pybullet stays DIRECT
+    # (fast, no 3D window) but the control panel is available for mode picking
+    # / live tuning. Maps to the server ctor's `show_control_gui` — the same
+    # surface launch_nodes.py's --control_gui flag drives for external sims.
+    # Only injected when True so server classes predating the kwarg keep
+    # working. No effect in non-headless mode (GUI already shows the panel)
+    # or when `external_port` is set (the external sim owns its GUI mode).
+    control_gui: bool = False
+
+    # When True, the in-process robot server composites PyBullet-computed
+    # shadows onto its Gaussian-splat renders (depth cue: the arm casts a
+    # visible shadow onto the table/objects). Maps to the server ctor's
+    # `splat_shadows` — the same surface launch_nodes.py's --splat_shadows
+    # flag drives for external sims. Only injected when True so server
+    # classes predating the kwarg keep working. NOTE: this CHANGES the
+    # images the policy sees, so eval imagery only matches training imagery
+    # when the recording sim used the same setting — keep it consistent
+    # across a lineage (dagger_orchestrate.sh --splat_shadows sets every
+    # phase at once). No effect when `external_port` is set (the external
+    # sim owns its own rendering config).
+    splat_shadows: bool = False
+
     # When True, the gym env exposes get_env_config() so the policy / wrapper can
     # access obstacle geometry and the task goal (q_goal_bias, target_ee_pos/quat).
     # Required for the shared autonomy wrapper's "RRT to Goal" mode.
@@ -1024,6 +1047,17 @@ class SplatSimEnv(EnvConfig):
             # No-op when headless is False (the default) — robot server's
             # ctor default leaves GUI mode on.
             splatsim_cfg = {**splatsim_cfg, "headless": self.headless}
+            # Keep the Tk control panel alongside headless when asked. Only
+            # inject when True: make_single_env passes cfg as **kwargs to the
+            # server ctor, and not every server class accepts show_control_gui.
+            if self.control_gui:
+                splatsim_cfg = {**splatsim_cfg, "show_control_gui": True}
+            # Splat shadow compositing for the in-process eval sim. Same
+            # inject-only-when-True rule as control_gui above (cfg is
+            # splatted as **kwargs into the server ctor, and older server
+            # classes don't accept the kwarg).
+            if self.splat_shadows:
+                splatsim_cfg = {**splatsim_cfg, "splat_shadows": True}
             splatsim_serve_mode = (
                 PybulletRobotServerBase.SERVE_MODES.EVAL_BENCHMARK
                 if self.eval_benchmark_repo_id is not None

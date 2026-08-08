@@ -156,6 +156,27 @@ def _find_shared_autonomy_wrapper(policy):
     return None
 
 
+def _extract_state_version(info: dict | None) -> int | None:
+    """Pull the env-mutation clock stamp out of a (vector-)env info dict.
+
+    Gym vector envs aggregate per-env infos into arrays keyed by the same
+    name; a plain env returns the scalar directly. Intervention mode runs
+    batch_size=1, so index 0 is THE env. Returns None when the env/server
+    doesn't stamp observations (pre-state_version SplatSim, non-splatsim
+    envs) so consumers can fall back to assuming freshness.
+    """
+    if not isinstance(info, dict):
+        return None
+    ver = info.get("state_version")
+    if ver is None:
+        return None
+    try:
+        arr = np.asarray(ver).reshape(-1)
+        return int(arr[0]) if arr.size else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _env_features_to_dataset_features(env_features: dict) -> dict:
     """Convert EnvConfig.features to the dict format expected by LeRobotDataset.create()."""
     features = {}
@@ -436,6 +457,18 @@ def rollout(
             except (AttributeError, NotImplementedError):
                 pass
 
+            # Inject the env-mutation clock stamped on THIS observation (from
+            # the info dict of the env.reset/env.step that produced it — NOT a
+            # live query, which would read post-mutation). The SA wrapper
+            # compares it against the version returned by its teleport RPC to
+            # detect an observation captured before a controller-driven
+            # teleport (the controller mutates the env AFTER env.step returned
+            # this obs, so the snapshot in hand is one mutation stale). Absent
+            # for envs/servers without the stamp.
+            _obs_state_version = _extract_state_version(info)
+            if _obs_state_version is not None:
+                observation["state_version"] = _obs_state_version
+
             with torch.inference_mode():
                 action = policy.select_action(observation)
             if predicted_latents_callback is not None:
@@ -570,7 +603,17 @@ def rollout(
             final_info = info.get("final_info", {})
             env_terminated = terminated | truncated
             for key, value in info.items():
-                if key in ("final_obs", "final_info", "is_success", "step_count") or key.startswith("_"):
+                # state_version is the env-mutation clock (bookkeeping consumed
+                # by the SA wrapper's teleport-staleness gate), not a metric —
+                # aggregating it would emit a meaningless avg_state_version and
+                # crash on rollouts where its presence varies across steps.
+                if key in (
+                    "final_obs",
+                    "final_info",
+                    "is_success",
+                    "step_count",
+                    "state_version",
+                ) or key.startswith("_"):
                     continue
                 if isinstance(value, np.ndarray) and value.shape == (env.num_envs,):
                     # Skip object-dtype arrays (strings, None mixes, arbitrary
