@@ -32,8 +32,30 @@ from .streaming_dataset import StreamingLeRobotDataset
 from .utils import resolve_episode_indices
 
 
+def unconsumed_camera_keys(
+    policy_cfg, ds_meta: LeRobotDatasetMetadata, rename_map: dict | None = None
+) -> list[str]:
+    """Camera features (dtype video/image) in ``ds_meta`` that the policy does
+    NOT consume — i.e. their post-rename_map name is absent from the policy's
+    input_features. These are safe to exclude from dataloading entirely (no
+    temporal window, no parquet-column materialization, no video decode).
+    Returns [] when the policy declares no input_features (nothing provable).
+    """
+    consumed = set(getattr(policy_cfg, "input_features", None) or {})
+    if not consumed:
+        return []
+    rename = dict(rename_map or {})
+    return [
+        key
+        for key, ft in ds_meta.features.items()
+        if ft.get("dtype") in ("video", "image") and rename.get(key, key) not in consumed
+    ]
+
+
 def resolve_delta_timestamps(
-    cfg: PreTrainedConfig | RewardModelConfig, ds_meta: LeRobotDatasetMetadata
+    cfg: PreTrainedConfig | RewardModelConfig,
+    ds_meta: LeRobotDatasetMetadata,
+    exclude_keys: set[str] | None = None,
 ) -> dict[str, list] | None:
     """Resolves delta_timestamps by reading from the 'delta_indices' properties of the config.
 
@@ -59,6 +81,8 @@ def resolve_delta_timestamps(
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
+            if exclude_keys and key in exclude_keys:
+                continue  # feature not consumed by the policy — don't build a temporal window for it
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
     if len(delta_timestamps) == 0:
@@ -90,6 +114,26 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             revision=cfg.dataset.revision,
             repo_type=cfg.dataset.repo_type,
         )
+        # Camera features the policy does NOT consume are excluded from
+        # dataloading entirely: no temporal window, no parquet column
+        # materialization, no video decode. Matters enormously for
+        # image-mode datasets (camera frames embedded as PNG bytes in the
+        # parquet rows): a state-only policy otherwise pays full per-row
+        # image extraction for tensors it throws away (~2.8x slower steps
+        # observed on the small_engine image-mode dataset). rename_map is
+        # honored so image trainings whose dataset keys rename into the
+        # policy's input_features (e.g. base_rgb_letterbox -> base_rgb)
+        # keep their cameras.
+        excluded_image_keys = unconsumed_camera_keys(
+            cfg.trainable_config, ds_meta, getattr(cfg, "rename_map", None)
+        )
+        if excluded_image_keys:
+            logging.info(
+                f"make_dataset: excluding {len(excluded_image_keys)} camera feature(s) the policy "
+                f"doesn't consume from dataloading: {excluded_image_keys}"
+            )
+        delta_timestamps = resolve_delta_timestamps(
+            cfg.trainable_config, ds_meta, exclude_keys=set(excluded_image_keys) or None
         delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta)
         episodes = resolve_episode_indices(
             cfg.dataset.episodes, ds_meta.total_episodes, cfg.dataset.exclude_episodes
@@ -110,6 +154,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 return_uint8=True,
                 depth_output_unit=cfg.dataset.depth_output_unit,
                 tolerance_s=cfg.tolerance_s,
+                exclude_features=excluded_image_keys or None,
             )
         else:
             dataset = StreamingLeRobotDataset(
@@ -142,13 +187,58 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_ids[0], root=cfg.dataset.root, revision=cfg.dataset.revision
         )
-        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        # Same unconsumed-camera exclusion as the single-source branch,
+        # computed on the base sub-dataset's meta (the sub that carries the
+        # camera features; passing a superset to camera-less interventions is
+        # a no-op — each reader drops only columns it actually has).
+        excluded_image_keys = unconsumed_camera_keys(cfg.policy, ds_meta, getattr(cfg, "rename_map", None))
+        if excluded_image_keys:
+            logging.info(
+                f"make_dataset (multi-source): excluding {len(excluded_image_keys)} camera "
+                f"feature(s) the policy doesn't consume from dataloading: {excluded_image_keys}"
+            )
+        delta_timestamps = resolve_delta_timestamps(
+            cfg.policy, ds_meta, exclude_keys=set(excluded_image_keys) or None
+        )
+        # In feature-intersection mode, resolve_delta_timestamps() built entries
+        # for EVERY observation.* key in the base sub-dataset's features — some
+        # of which don't exist in the other sub-datasets (that's the whole
+        # reason the user opted in). MultiLeRobotDataset forwards the same
+        # delta_timestamps dict to every sub-dataset's LeRobotDataset, and each
+        # sub-dataset's DatasetReader precomputes delta_indices and later
+        # fetches every key at __getitem__ time — including keys that don't
+        # exist in its underlying hf_dataset → ValueError("Column X doesn't
+        # exist") on the first batch. Filter to the cross-sub-dataset feature
+        # intersection so no sub-dataset ever gets asked for a column it lacks.
+        # This mirrors MultiLeRobotDataset's own `disabled_features` intersection
+        # (line ~76-91) but at the delta_timestamps level, where the fetch is
+        # actually driven from.
+        if cfg.dataset.multi_source_feature_intersection and delta_timestamps:
+            other_metas = [
+                LeRobotDatasetMetadata(rid, root=cfg.dataset.root, revision=cfg.dataset.revision)
+                for rid in cfg.dataset.repo_ids[1:]
+            ]
+            feature_intersection = set(ds_meta.features)
+            for m in other_metas:
+                feature_intersection &= set(m.features)
+            dropped = set(delta_timestamps) - feature_intersection
+            if dropped:
+                logging.warning(
+                    "Multi-source: dropping %d delta_timestamps key(s) not present in "
+                    "every sub-dataset: %s. (multi_source_feature_intersection=True)",
+                    len(dropped),
+                    sorted(dropped),
+                )
+                delta_timestamps = {k: v for k, v in delta_timestamps.items() if k in feature_intersection}
+                if not delta_timestamps:
+                    delta_timestamps = None
         multi = MultiLeRobotDataset(
             repo_ids=cfg.dataset.repo_ids,
             root=cfg.dataset.root,
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             video_backend=cfg.dataset.video_backend,
+            exclude_features=excluded_image_keys or None,
         )
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
@@ -170,14 +260,30 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             features={**cfg.policy.input_features, **cfg.policy.output_features},
             norm_map=cfg.policy.normalization_mapping,
             norm_mode=cfg.dataset.norm_mode,
+            allow_key_mismatch=cfg.dataset.multi_source_feature_intersection,
         )
 
     if cfg.dataset.use_imagenet_stats:
-        for key in dataset.meta.camera_keys:
-            if key in dataset.meta.depth_keys:
-                continue  # Exclude depth keys from ImageNet stats
-            for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+        # Bind to a local so pyright can narrow away the `| None` half of
+        # LeRobotDatasetMetadata.stats' declared type. In practice stats is
+        # never None once the dataset (or MultiSourceNormalizingDataset) is
+        # constructed, but the type says it can be.
+        meta_stats = dataset.meta.stats
+        if meta_stats is not None:
+            for key in dataset.meta.camera_keys:
+                if key in dataset.meta.depth_keys:
+                    continue  # Exclude depth keys from ImageNet stats
+                # In multi-source intersection mode, camera_keys forwards from
+                # the base sub-dataset's meta and can include image keys that
+                # were DROPPED from the aggregated stats because some other
+                # source didn't have them. Skip those — there's no stats slot
+                # to inject into, and the policy in that scenario doesn't
+                # consume them anyway (that's why the user opted into
+                # intersection mode).
+                if key not in meta_stats:
+                    continue
+                for stats_type, stats in IMAGENET_STATS.items():
+                    meta_stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
     return dataset
 

@@ -65,6 +65,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
+        exclude_features: list[str] | None = None,
         *,
         token: str | bool | None = None,
     ):
@@ -254,6 +255,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
             episodes = resolved
         self.episodes = episodes
 
+        # Features to fully skip at load time (columns dropped from the HF
+        # view + video keys never decoded). See DatasetReader.exclude_features.
+        self._exclude_features = list(exclude_features or [])
+
         # Create reader (hf_dataset loaded below)
         self.reader = DatasetReader(
             meta=self.meta,
@@ -265,6 +270,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             image_transforms=image_transforms,
             return_uint8=self._return_uint8,
             depth_output_unit=self._depth_output_unit,
+            exclude_features=self._exclude_features,
         )
         self.image_transforms = image_transforms
 
@@ -339,6 +345,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 image_transforms=self.image_transforms,
                 return_uint8=self._return_uint8,
                 depth_output_unit=self._depth_output_unit,
+                exclude_features=getattr(self, "_exclude_features", None),
             )
         return self.reader
 

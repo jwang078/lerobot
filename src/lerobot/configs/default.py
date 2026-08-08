@@ -97,6 +97,23 @@ class DatasetConfig:
     sample_weights: list[float] | None = None
     stats_paths: list[str] | None = None
     norm_mode: str = "aggregated"
+    # When True, MultiSourceNormalizingDataset uses the INTERSECTION of feature
+    # keys across sub-datasets instead of requiring every sub-dataset to
+    # contribute stats for the SAME feature set. Any feature that some source
+    # is missing gets dropped from the aggregated stats AND from the
+    # per-source stats used at normalization time.
+    #
+    # Escape hatch for the case where the base dataset has recorded features
+    # the policy doesn't consume (e.g. base recorded with base_rgb images but
+    # DAgger intervention was recorded state-only, and the trained policy is
+    # state-only anyway). Default False so unintended schema drift still
+    # trips the loud consistency check.
+    #
+    # Safe even when a dropped feature IS in `policy.input_features` —
+    # normalization for that key simply won't happen (the preprocessor
+    # doesn't look up stats it wasn't given), which is fine only if the
+    # policy tolerates unnormalized inputs on that key. Use with intent.
+    multi_source_feature_intersection: bool = False
     # Opt into the fork-only WeightedRandomSampler path. When True, requires
     # `sample_weights` to be set; the DataLoader draws with per-frame
     # probability so each sub-dataset's expected batch share matches
@@ -106,6 +123,20 @@ class DatasetConfig:
     # get silently swapped onto a different sampler. Validated at
     # __post_init__.
     use_weighted_sampling: bool = False
+    # Per-key Gaussian noise added to observation.* features at training time
+    # ONLY (not at eval-loss / rollout eval). Keys are the exact feature names
+    # in a batch dict (e.g. "observation.state", "observation.environment_state");
+    # values are the noise σ in raw feature units (rad for joint states, meters
+    # for spatial state coords). None (default) = no noise. Applied BEFORE the
+    # preprocessor's normalizer step so the noise magnitude is meaningful in
+    # physical units (post-normalizer the same σ would mean different things
+    # per dim).
+    # Motivation: small state noise combats overfitting in low-data regimes —
+    # the policy learns action robustness to observation perturbations rather
+    # than exact memorization of (state → action) pairs. Not applied to action
+    # (that would corrupt the target signal).
+    # Example: --dataset.observation_noise_std='{"observation.state": 0.01, "observation.environment_state": 0.005}'
+    observation_noise_std: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         if self.repo_type not in ("dataset", "bucket"):
@@ -155,6 +186,12 @@ class DatasetConfig:
                     f"len(sample_weights)={len(self.sample_weights)} must equal "
                     f"len(repo_ids)={len(self.repo_ids)} in weighted-sampling mode."
                 )
+        if self.observation_noise_std is not None:
+            for k, v in self.observation_noise_std.items():
+                if not isinstance(k, str) or not k.startswith("observation."):
+                    raise ValueError(f"observation_noise_std keys must start with 'observation.'; got {k!r}")
+                if not isinstance(v, (int, float)) or v < 0:
+                    raise ValueError(f"observation_noise_std[{k!r}] must be a non-negative float; got {v!r}")
 
 
 @dataclass

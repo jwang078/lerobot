@@ -48,6 +48,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         tolerances_s: dict | None = None,
         download_videos: bool = True,
         video_backend: str | None = None,
+        exclude_features: list[str] | None = None,
         *,
         token: str | bool | None = None,
     ):
@@ -65,6 +66,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                 image_transforms=image_transforms,
                 delta_timestamps=delta_timestamps,
                 tolerance_s=self.tolerances_s[repo_id],
+                exclude_features=exclude_features,
                 download_videos=download_videos,
                 video_backend=video_backend,
                 token=token,
