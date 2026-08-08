@@ -60,6 +60,7 @@ class DatasetReader:
         image_transforms: Callable | None,
         return_uint8: bool = False,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        exclude_features: list[str] | None = None,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -81,6 +82,13 @@ class DatasetReader:
                 instead of normalized float32.
             depth_output_unit: Physical unit depth maps are dequantized to
                 (``"m"`` or ``"mm"``). Defaults to ``"mm"``.
+            exclude_features: Optional dataset feature keys to fully skip at
+                load time: parquet-embedded columns are dropped from the HF
+                dataset view (so row access never materializes them — for
+                image-mode datasets a single full-row read otherwise decodes
+                every embedded PNG) and video keys are skipped in the decode
+                path. Used by the train factory to drop camera features a
+                state-only policy doesn't consume.
         """
         self._meta = meta
         self.root = root
@@ -92,6 +100,7 @@ class DatasetReader:
         self._image_transforms = image_transforms
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
+        self._exclude_features: set[str] = set(exclude_features or [])
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
@@ -99,6 +108,10 @@ class DatasetReader:
         # Setup delta_indices (doesn't depend on hf_dataset)
         self.delta_indices = None
         if delta_timestamps is not None:
+            if self._exclude_features:
+                delta_timestamps = {
+                    k: v for k, v in delta_timestamps.items() if k not in self._exclude_features
+                }
             check_delta_timestamps(delta_timestamps, meta.fps, tolerance_s)
             self.delta_indices = get_delta_indices(delta_timestamps, meta.fps)
 
@@ -113,6 +126,27 @@ class DatasetReader:
             for key in self._meta.depth_keys
             if key in self._meta.image_keys
         }
+
+    def _apply_feature_exclusions(self) -> None:
+        """Drop excluded parquet columns from the loaded HF dataset view.
+
+        Cheap schema-level operation; the point is that a subsequent row
+        access (``hf_dataset[idx]``) no longer materializes the excluded
+        columns — the dominant cost for image-mode datasets whose camera
+        frames are PNG bytes embedded in the parquet rows.
+        """
+        if self.hf_dataset is None or not self._exclude_features:
+            return
+        drop = [c for c in self.hf_dataset.column_names if c in self._exclude_features]
+        if drop:
+            self.hf_dataset = self.hf_dataset.remove_columns(drop)
+
+    @property
+    def _active_video_keys(self) -> list[str]:
+        """Video keys minus the excluded ones (excluded videos are never decoded)."""
+        if not self._exclude_features:
+            return self._meta.video_keys
+        return [k for k in self._meta.video_keys if k not in self._exclude_features]
 
     def set_image_transforms(self, image_transforms: Callable | None) -> None:
         """Replace the transform applied to visual observations."""
@@ -134,12 +168,14 @@ class DatasetReader:
         if not self._check_cached_episodes_sufficient():
             self.hf_dataset = None
             return False
+        self._apply_feature_exclusions()
         self._build_index_mapping()
         return True
 
     def load_and_activate(self) -> None:
         """Load HF dataset from disk and build index mapping. Call after data is on disk."""
         self.hf_dataset = self._load_hf_dataset()
+        self._apply_feature_exclusions()
         self._build_index_mapping()
 
     def _build_index_mapping(self) -> None:
@@ -241,9 +277,10 @@ class DatasetReader:
         self, abs_idx: int, ep_idx: int
     ) -> tuple[dict[str, list[int]], dict[str, torch.Tensor]]:
         """Compute query indices for delta timestamps."""
-        ep = self._meta.episodes[ep_idx]
-        ep_start = ep["dataset_from_index"]
-        ep_end = ep["dataset_to_index"]
+        # Scalar reads, not a full row materialization — see the note in
+        # `_query_videos` (a metadata row can be ~1 MB / ~19 ms).
+        ep_start = self._meta.episode_scalar(ep_idx, "dataset_from_index")
+        ep_end = self._meta.episode_scalar(ep_idx, "dataset_to_index")
         query_indices = {
             key: [max(ep_start, min(ep_end - 1, abs_idx + delta)) for delta in delta_idx]
             for key, delta_idx in self.delta_indices.items()
@@ -262,7 +299,7 @@ class DatasetReader:
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self._meta.video_keys:
+        for key in self._active_video_keys:
             if query_indices is not None and key in query_indices:
                 if self._absolute_to_relative_idx is not None:
                     relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
@@ -297,10 +334,14 @@ class DatasetReader:
         in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
         Segmentation Fault.
         """
-        ep = self._meta.episodes[ep_idx]
 
+        # NOTE: read per-episode scalars via `episode_scalar`, never
+        # `self._meta.episodes[ep_idx]` — the latter materializes the entire
+        # metadata row, which is ~1 MB (and ~19 ms) on datasets that store
+        # large per-episode blobs (e.g. SplatSim's splatsim_robot_config).
+        # That single line cost more than the video decode it precedes.
         def _decode_single(vid_key: str, query_ts: list[float]) -> tuple[str, torch.Tensor]:
-            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+            from_timestamp = self._meta.episode_scalar(ep_idx, f"videos/{vid_key}/from_timestamp")
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
             video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
             frames = decode_video_frames(
@@ -329,7 +370,16 @@ class DatasetReader:
         if len(items) <= 1:
             return {vid_key: _decode_single(vid_key, query_ts)[1] for vid_key, query_ts in items}
 
-        # Multi-camera: decode in parallel (video decoding releases the GIL)
+        # Multi-camera. Fan out ONLY in the main process. Inside a DataLoader
+        # worker the parallelism already exists across samples, and video
+        # decoders are themselves internally multithreaded — nesting the two
+        # oversubscribes the CPU badly (measured: 4 cameras took 182 ms
+        # threaded vs 47 ms serial, ~3.9x slower, with 4 workers x 4 cameras
+        # of AV1 decode competing for 24 cores). Serial per sample is the
+        # right choice there; the workers keep the cores busy.
+        if torch.utils.data.get_worker_info() is not None:
+            return {vid_key: _decode_single(vid_key, query_ts)[1] for vid_key, query_ts in items}
+
         with ThreadPoolExecutor(max_workers=len(items)) as pool:
             futures = [pool.submit(_decode_single, k, ts) for k, ts in items]
             return dict(f.result() for f in futures)
@@ -353,7 +403,7 @@ class DatasetReader:
             for key, val in query_result.items():
                 item[key] = val
 
-        if len(self._meta.video_keys) > 0:
+        if len(self._active_video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
@@ -362,6 +412,10 @@ class DatasetReader:
         if self._image_transforms is not None:
             for cam in self._meta.camera_keys:
                 if cam in self._meta.depth_keys:
+                    continue
+                # Excluded camera features never enter the item (see
+                # exclude_features) — skip rather than KeyError.
+                if cam not in item:
                     continue
                 item[cam] = self._image_transforms(item[cam])
 

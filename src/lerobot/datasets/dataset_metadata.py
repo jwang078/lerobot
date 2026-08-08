@@ -307,6 +307,45 @@ class LeRobotDatasetMetadata:
         """Codebase version used to create this dataset."""
         return packaging.version.parse(self.info.codebase_version)
 
+    def episode_scalar(self, ep_index: int, column: str):
+        """Read one scalar field of an episode's metadata row, cheaply.
+
+        Indexing the episodes HF/Arrow dataset (``self.episodes[ep_index]``)
+        materializes the WHOLE row. That is ruinous when a producer stores
+        large per-episode blobs: SplatSim writes ``splatsim_robot_config``
+        (which embeds the ~865 KB static gaussian ``segmented_list``) on every
+        episode, making a 500-episode table ~500 MB and a single row lookup
+        ~19 ms. The video-decode path needs only tiny scalars
+        (chunk/file index, from_timestamp) but paid that cost once per video
+        key per sample — dominating dataloader time for video datasets.
+
+        So cache the SCALAR columns column-wise once (cheap and small; blob
+        columns are skipped entirely) and serve per-episode reads from it.
+        Falls back to a full row read for non-scalar columns.
+
+        The cache is keyed on the identity of ``self.episodes`` so any
+        reassignment (e.g. ``filter_episodes``) transparently rebuilds it.
+        Indexing stays POSITIONAL, matching the callers this replaces.
+        """
+        episodes = self.episodes
+        cache = getattr(self, "_ep_scalar_cache", None)
+        if cache is None or cache[0] is not id(episodes):
+            columns: dict[str, list] = {}
+            table = getattr(episodes, "data", None)
+            if table is not None:
+                for name in table.column_names:
+                    col = table.column(name)
+                    # Primitives only — never pull blob/nested columns into RAM.
+                    if pa.types.is_primitive(col.type) or pa.types.is_string(col.type):
+                        with contextlib.suppress(Exception):
+                            columns[name] = col.to_pylist()
+            cache = (id(episodes), columns)
+            self._ep_scalar_cache = cache
+        values = cache[1].get(column)
+        if values is not None:
+            return values[ep_index]
+        return episodes[ep_index][column]
+
     def get_data_file_path(self, ep_index: int) -> Path:
         """Return the relative parquet file path for the given episode index.
 
@@ -325,9 +364,8 @@ class LeRobotDatasetMetadata:
             raise IndexError(
                 f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
             )
-        ep = self.episodes[ep_index]
-        chunk_idx = ep["data/chunk_index"]
-        file_idx = ep["data/file_index"]
+        chunk_idx = self.episode_scalar(ep_index, "data/chunk_index")
+        file_idx = self.episode_scalar(ep_index, "data/file_index")
         fpath = self.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
         return Path(fpath)
 
@@ -351,9 +389,8 @@ class LeRobotDatasetMetadata:
             raise IndexError(
                 f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
             )
-        ep = self.episodes[ep_index]
-        chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
-        file_idx = ep[f"videos/{vid_key}/file_index"]
+        chunk_idx = self.episode_scalar(ep_index, f"videos/{vid_key}/chunk_index")
+        file_idx = self.episode_scalar(ep_index, f"videos/{vid_key}/file_index")
         fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
         return Path(fpath)
 
