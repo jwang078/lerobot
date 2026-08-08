@@ -48,14 +48,16 @@ logger = logging.getLogger(__name__)
 #                              legacy callers that haven't migrated to TELEOP).
 #   PADDING                  — post-teleop pad-to-min frames; committed only
 #                              to reach min_episode_length.
-#   BLEND_INTERVENTION_000   — controller-driven blend at ratio=0.00; committed.
-#   BLEND_INTERVENTION_001   — ratio=0.01; committed.
-#   ...                        (101 members total, 0..100)
-#   BLEND_INTERVENTION_100   — ratio=1.00 (verbatim controller drive); committed.
-#
-# OracleGoalGuidanceSource (Step 5) emits one of the BLEND_INTERVENTION_<pct>
-# members depending on the wrapper's `forward_flow_ratio` at the time of the
-# frame. The downstream dataset can then filter / weight by ratio.
+#   BLEND_INTERVENTION_<pct> — controller-driven blend frames; committed.
+#     <pct> is the INTERVENTION (guidance) share of the blend, 000..100:
+#       _000 = 0% intervention (pure policy)
+#       _100 = 100% intervention (verbatim controller drive — what
+#              OracleGoalGuidanceSource emits for its VERBATIM playback)
+#     NOTE the sign convention: this is the COMPLEMENT of the wrapper's
+#     `forward_flow_ratio` (where 0.0 = pure guidance and 1.0 = pure
+#     policy). A caller tagging frames from a wrapper ratio must pass
+#     (1 - forward_flow_ratio) to `blend_at_ratio`, not the ratio itself.
+#     The downstream dataset can then filter / weight by intervention share.
 _FRAME_SOURCE_BASE = {"TELEOP": "teleop", "RRT": "rrt", "POLICY": "policy", "PADDING": "padding"}
 _FRAME_SOURCE_BLEND = {f"BLEND_INTERVENTION_{i:03d}": f"blend_intervention_{i:03d}" for i in range(101)}
 FrameSource = Enum(  # type: ignore[misc]
@@ -68,7 +70,10 @@ FrameSource = Enum(  # type: ignore[misc]
 def _blend_at_ratio(cls, ratio: float) -> FrameSource:  # type: ignore[valid-type]
     """Return the `BLEND_INTERVENTION_<pct>` member for the given ratio in [0, 1].
 
-    Ratio is clamped to [0, 1] and rounded to 2 decimal places, then formatted
+    `ratio` is the INTERVENTION (guidance) share — 1.0 = verbatim controller
+    drive, 0.0 = pure policy. This is the COMPLEMENT of the wrapper's
+    forward_flow_ratio; pass (1 - forward_flow_ratio) when converting.
+    Clamped to [0, 1] and rounded to 2 decimal places, then formatted
     as a 3-digit zero-padded integer matching the enum member naming. Examples:
         0.00 → BLEND_INTERVENTION_000
         0.65 → BLEND_INTERVENTION_065
@@ -349,6 +354,13 @@ class TeleopRecordingWrapper(gym.Wrapper):
     def _step_raw(self, action: np.ndarray):
         """Step via robot_server, build frame, return (frame, gym_obs, rew, term, trunc, info)."""
         raw_obs, reward, terminated, truncated, info = self.env.robot_server.step(action)
+        # This path bypasses SplatSimGymEnv.step, so mirror its env-mutation
+        # clock stamping (obs → info) — otherwise recorded (guidance-active)
+        # frames lack the stamp and the SA wrapper's teleport-staleness gate
+        # is blind exactly when controller-driven teleports happen (mid-RRT).
+        _ver = raw_obs.get("state_version")
+        if _ver is not None:
+            info["state_version"] = int(_ver)
         gym_obs = self.env._to_gym_obs(raw_obs)
         frame = self._build_frame(action, gym_obs, raw_obs)
         return frame, gym_obs, reward, terminated, truncated, info

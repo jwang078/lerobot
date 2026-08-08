@@ -127,6 +127,26 @@ class DiffusionConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.MIN_MAX,
         }
     )
+    # Opt-in: normalize `observation.environment_state` (FeatureType.ENV) the
+    # same way as `observation.state`.
+    #
+    # This mapping has no "ENV" entry, so NormalizerProcessorStep's
+    # `norm_map.get(feature_type, IDENTITY)` silently passes env_state through
+    # RAW while obs.state is scaled to [-1, 1]. For oracle / state-only setups
+    # (planar reach, PushT keypoints) env_state is the policy's dominant input,
+    # and leaving it unnormalized both under-weights narrow-range dims relative
+    # to wide-range ones and skips centering. Only 2 of the ~19 policy configs
+    # in this repo declare ENV at all (gaussian_actor: MIN_MAX, tdmpc:
+    # IDENTITY), so the omission here is an upstream default rather than a
+    # deliberate choice.
+    #
+    # DEFAULT False = byte-identical legacy behavior; existing checkpoints
+    # (whose saved configs predate this field) keep loading and evaluating
+    # exactly as before. Flipping it to True changes the network's input
+    # distribution (per-dim gain 2/(max-min) plus a centering shift), so it is
+    # NOT finetune-compatible: a lineage must be trained from scratch under a
+    # single consistent setting. CLI: --policy.normalize_env_state=true
+    normalize_env_state: bool = False
 
     # Architecture / modeling.
     # Vision backbone.
@@ -187,6 +207,16 @@ class DiffusionConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # Mirror STATE's mode so "normalize env_state like state" stays true
+        # even if STATE's mode is overridden. Only ever ADDS the entry: an
+        # explicit "ENV" already in the mapping (set directly by a caller, or
+        # deserialized from a checkpoint trained with this flag on) wins and is
+        # never stripped, so the injection is idempotent across save/load.
+        if self.normalize_env_state and "ENV" not in self.normalization_mapping:
+            self.normalization_mapping["ENV"] = self.normalization_mapping.get(
+                "STATE", NormalizationMode.MIN_MAX
+            )
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):

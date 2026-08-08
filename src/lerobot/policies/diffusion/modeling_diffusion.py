@@ -101,9 +101,7 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
-    def predict_action_chunk(
-        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs
-    ) -> Tensor:
+    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs) -> Tensor:
         """Predict a chunk of actions given environment observations.
 
         Supports two modes:
@@ -171,15 +169,28 @@ class DiffusionPolicy(PreTrainedPolicy):
         Each entry pushed into ``self._queues[ACTION]`` has shape
         ``(B, action_dim)`` (popped one per select_action call). Stacking the
         remaining entries gives ``(n_remaining_steps, B, action_dim)``.
-        Returns None when the queue is empty (e.g., before first select_action
-        or just after the chunk drained and before regeneration).
+
+        Returns None when:
+          * the queue dict hasn't been built yet (pre-first-reset),
+          * the ACTION queue is empty (pre-first-select_action, or after
+            drain-then-regenerate),
+          * any queue entry is None (defensive — should never happen through
+            the normal write paths but crashed the SA wrapper's shield mid-
+            run, so we swallow it here rather than take down the whole eval).
         """
         if self._queues is None:
             return None
         q = self._queues.get(ACTION)
         if q is None or len(q) == 0:
             return None
-        return torch.stack(tuple(q), dim=0)
+        # Defensive: torch.stack blows up with "expected Tensor as element X"
+        # when any entry is None (or non-tensor). Treat that as "no valid
+        # cached chunk right now" instead of propagating — the caller
+        # (SA-wrapper future-chunk shield) already handles a None return.
+        entries = tuple(q)
+        if any(e is None or not isinstance(e, Tensor) for e in entries):
+            return None
+        return torch.stack(entries, dim=0)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""

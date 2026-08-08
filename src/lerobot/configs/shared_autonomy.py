@@ -25,9 +25,14 @@ and schedule of the denoising process. The forward_flow_ratio parameter
 controls the trade-off between fidelity (preserving human intent) and
 conformity (following learned behavior distribution):
 
-- forward_flow_ratio = 0.0: No intervention, return human action directly
-- forward_flow_ratio = 0.4: Moderate blending (recommended default)
-- forward_flow_ratio = 1.0: Full model control, ignore human input
+- forward_flow_ratio = 0.0: pure guidance — the obs-teleop source emits the
+  guidance action VERBATIM (teleop passthrough); no denoising runs.
+- forward_flow_ratio = 0.4: moderate blend — x_tsw = 0.4·noise + 0.6·guidance
+  (guidance-leaning; LOWER ratio = MORE guidance influence).
+- forward_flow_ratio = 1.0: pure policy — x_tsw is (almost) all noise, so a
+  full-length denoise ≈ the policy's own sample; guidance contributes ~nothing
+  ("blend100"). Applies to the obs-teleop blending path only: RRT and
+  oracle-goal chunks play verbatim regardless of this ratio.
 """
 
 from dataclasses import dataclass, field
@@ -100,6 +105,30 @@ class FutureChunkConfig:
     # (legacy default).
     obstacle_clearance: float | None = 0.0
     self_collision_clearance: float | None = 0.0
+    # Per-driver clearance override for WHILE AN RRT CHUNK IS EXECUTING.
+    # The `obstacle_clearance` / `self_collision_clearance` above gate the
+    # shield while the POLICY is driving (strict — preempt early). But the
+    # mid-RRT collision retrigger (InterventionController, `Collision
+    # detected mid-RRT`) is driven by the ENV's near-miss `in_collision`
+    # flag, whose clearance is typically the planner's ROUTING margin
+    # (~0.02 m) — stricter than makes sense mid-RRT, where the planned path
+    # deliberately squeezes near obstacles and killing the chunk at 16-18 mm
+    # causes replan churn (replan → all IKs excluded → natural-finish →
+    # shield refires → repeat). When set, the controller RE-VERIFIES the
+    # env's flag against these looser clearances at the robot's current
+    # pose and ignores the flag unless they're violated (e.g. 0.01 = only
+    # retrigger within 10 mm while RRT drives). None (default) = legacy
+    # behavior: trust the env's flag as-is.
+    rrt_obstacle_clearance: float | None = None
+    rrt_self_collision_clearance: float | None = None
+    # Ticks to suppress the shield after a FAILED shield-triggered plan
+    # (start wedged in collision, all escapes failed, no goal, ...). Guards
+    # against spending every tick on a blocking escape-chain/plan attempt
+    # (~50-200 ms each) against the same unresolvable collision. 0 disables
+    # the cooldown entirely — the shield then re-attempts a plan EVERY tick
+    # while the predicted collision persists, which can stall the control
+    # loop; only do that if plan failures are rare in your setup.
+    plan_fail_cooldown_ticks: int = 15
 
 
 @dataclass
@@ -118,6 +147,11 @@ class SharedAutonomyConfig:
     policy_guidance_action_buffer_size: int = 1
     apply_to_first_action_only: bool = True
     show_slider: bool = True  # launch a Tkinter slider to adjust forward_flow_ratio live
+    # Open the wrapper's own pybullet window even when show_slider is False.
+    # show_slider historically gated BOTH the Tk slider AND p.GUI vs p.DIRECT;
+    # headless pipelines (e.g. augment_dataset_with_blending) that want the
+    # guidance-ghost visualization need the window WITHOUT the slider thread.
+    pybullet_gui: bool = False
     start_paused: bool = False  # start with policy paused (unpause via GUI button)
     # Robot splat name — resolves to a URDF via SplatObjectConfig.
     # `None` (default) = auto-detect from the env's oracle_env_config on the
@@ -128,6 +162,9 @@ class SharedAutonomyConfig:
     # robots (planar_3joint, future variants) don't crash the wrapper by
     # loading the wrong URDF.
     robot_name: str | None = None
+    # RETIRED — no longer consumed anywhere (the velocity-limit code it fed
+    # was removed). Kept ONLY so config.json from existing checkpoints (which
+    # serialize this field) still deserializes; do not wire new behavior to it.
     max_joint_delta: float = 0.016
     # Arm-joint DOF count (excludes gripper). `None` (default) = auto-detect
     # from the inner policy's action-feature-names by counting non-gripper
@@ -135,22 +172,24 @@ class SharedAutonomyConfig:
     # Set explicitly to override the heuristic.
     num_dofs: int | None = None
     blend_mode: str = "every_step"  # "every_step" or "once_per_chunk"
-    # Number of action steps at the start of each chunk to anchor exactly to guidance via inpainting.
-    # 0 = current behavior (full-chunk blending only). k > 0 = clamp first k steps to guidance
-    # inside the denoising loop, letting the model generate a coherent continuation from those steps.
-    # Only applies to GuidanceBlendStrategy.DENOISE.
+    # Number of action steps at the start of each chunk to anchor exactly to guidance.
+    # 0 = current behavior (full-chunk blending only). k > 0: strategy-dependent —
+    # under GuidanceBlendStrategy.DENOISE the sampler re-anchors the first k steps
+    # to guidance at every denoising step (in-loop inpainting), letting the model
+    # generate a coherent continuation from those steps; under INTERPOLATE the same
+    # k steps are snapped to guidance post-hoc after the linear mix (no sampler to
+    # re-anchor inside).
     n_anchor_steps: int = 0
+    # Consumed only by the PI0.5-specific shared-autonomy path
+    # (policies/pi05/modeling_shared_autonomy.py), NOT by
+    # SharedAutonomyPolicyWrapper.
     debug: bool = False
+    # RETIRED — consumed nowhere (the RTC debug buffer has its own separate
+    # debug_maxlen). Kept ONLY because existing checkpoints serialize this
+    # field and draccus decode is strict (removing it would make every
+    # existing checkpoint's config.json unloadable). Do not wire new
+    # behavior to it.
     debug_maxlen: int = 100
-    # DEBUG-ONLY: force the future-chunk shield to report a collision every
-    # tick regardless of the actual FK check. Exercises the full shield-trigger
-    # path (denormalize_chunk_to_raw + _flush_inner_action_queue +
-    # _rrt_source.trigger) at 100% duty cycle so bugs that only manifest under
-    # heavy shield firing (e.g. per-tick oscillation from queue thrashing or
-    # shared-anchor mutation) are reproducible even in a scenario with no
-    # real collisions. Leave False in normal runs. Requires
-    # `rrt_collision_detection` ∈ {"future_chunk", "hybrid"} to have any
-    # effect.
     # Rate-limit the future-chunk shield: only run `_check_future_chunk_collision`
     # every N ticks. Default 1 (every tick — legacy behavior). Set to 5-10 when
     # inference is slow (state-based diffusion, big U-Nets) so the shield's
@@ -162,6 +201,15 @@ class SharedAutonomyConfig:
     # the same predicted collision K-1 ticks later — still well before it
     # arrives (collisions are typically 3-8 chunk-steps out).
     shield_check_every_n_ticks: int = 1
+    # DEBUG-ONLY: force the future-chunk shield to report a collision every
+    # tick regardless of the actual FK check. Exercises the full shield-trigger
+    # path (denormalize_chunk_to_raw + _flush_inner_action_queue +
+    # _rrt_source.trigger) at 100% duty cycle so bugs that only manifest under
+    # heavy shield firing (e.g. per-tick oscillation from queue thrashing or
+    # shared-anchor mutation) are reproducible even in a scenario with no
+    # real collisions. Leave False in normal runs. Requires
+    # `rrt_collision_detection` ∈ {"future_chunk", "hybrid"} to have any
+    # effect.
     debug_shield_force_trigger: bool = False
     # DEBUG-ONLY: log a snapshot of the SA-wrapper's own postprocessor
     # RelativeActionsProcessorStep._last_state before AND after every
@@ -175,9 +223,12 @@ class SharedAutonomyConfig:
     # ticks and drowns the rest of the log; enable when debugging phantom
     # state / rel-action-postprocessor drift bugs.
     debug_rrt_drift_log: bool = False
-    # Control rate (Hz) used by the RRT-to-Goal mode for ruckig time parametrization.
-    # Should match the env's fps. Only consulted when the GUI's "RRT to Goal" button
-    # is pressed, so a slightly off value just changes the trajectory pacing.
+    # Control rate (Hz) used for ruckig time parametrization of RRT chunks.
+    # Should match the env's fps. Consulted on EVERY RRT plan (controller
+    # triggers, the future-chunk shield, and the GUI's "RRT to Goal" button —
+    # it's baked into the RRTToGoalPlanner at construction), and to convert
+    # the per-tick recent-joint-velocity into rad/s for no-lookback plans.
+    # A slightly off value just changes the trajectory pacing.
     fps: int = 30
     # Selects which collision-detection mode drives RRT triggering.
     # Options:
@@ -231,22 +282,32 @@ class SharedAutonomyConfig:
     #   * "joint_arc_length" — minimize joint-space L2 distance summed across
     #     waypoints. Legacy behavior; tends to pick paths that land near
     #     q_start in configuration space even if the EE swings wide.
-    #   * "joint_velocity_match" — minimize L2 deviation between the
-    #     candidate's initial joint velocity and the robot's recent joint
-    #     velocity (averaged over the trailing samples of
-    #     `_actual_q_history`). Picks the path that maintains the robot's
-    #     current motion direction the most, minimizing the velocity
-    #     discontinuity at the trigger moment. Requires enough history to
-    #     derive a velocity (≥2 samples); raises if not.
+    #   * "joint_velocity_match" — minimize the cosine distance between the
+    #     candidate's initial DIRECTION and the robot's recent direction
+    #     (derived from the trailing samples of `_actual_q_history`).
+    #     Direction-only (not magnitude-matching — waypoint deltas and
+    #     per-tick velocity are in different units). Picks the path that
+    #     starts off in the direction the robot was already moving,
+    #     minimizing the velocity discontinuity at the trigger moment.
+    #     Falls back to EE arc-length when the recent velocity is near
+    #     zero (typical collision/stall trigger); raises when no recent
+    #     velocity is available (needs ≥2 history samples to derive one).
+    #   * "min_pair_clearance" — maximize the minimum distance between any
+    #     non-adjacent link pair along the path (skip-pairs excluded).
+    #     Avoids "pretzeled" poses; see `rrt_diagnostic_log_pairs`.
+    #   * "camera_scoring" — prefer paths that keep the wrist camera
+    #     aimed at the goal EE position.
     # None passes through to the planner's default (EE_ARC_LENGTH).
     rrt_path_selection: str | None = None
     # IK-goal-selection strategy: scores AMONG the IK candidates BEFORE
     # running RRT, based on goal-state geometry alone (no planned path
     # needed). When set, the planner sorts candidates by this score,
     # tries RRT in order, and takes the FIRST successful plan —
-    # `rrt_path_selection` is unused in this mode because each candidate's
-    # path goes to a different goal, so cross-path comparison is
-    # meaningless once IK selection has committed to a goal.
+    # `rrt_path_selection` no longer does cross-IK comparison because each
+    # candidate's path goes to a different goal, so comparing paths across
+    # goals is meaningless once IK selection has committed to one. (It still
+    # picks among each IK's OWN path candidates when
+    # `rrt_num_path_candidates_per_ik` > 1 — see below.)
     # Options:
     #   "joint_distance" — minimize ||q_candidate - q_start||. For
     #     redundant arms (7-DOF) this picks the IK branch that requires
@@ -396,12 +457,39 @@ class SharedAutonomyConfig:
     rrt_final_approach_acc_scale: float = 0.25
     # Equalize joint-space path speed across RRT path sections (mirrors
     # SplatSim's TrajectoryGenModeConfig.uniform_path_speed so intervention
-    # chunks and traj-gen demos share the same execution-speed profile —
-    # keep the two defaults in lockstep). Removes the direction-anisotropy
-    # surging of per-joint box velocity limits. See
-    # ruckig_parametrize_path(uniform_path_speed=). Off by default
-    # (time-optimal, historical); enable together with the SplatSim side.
+    # chunks and traj-gen demos can share the same execution-speed profile).
+    # Removes the direction-anisotropy surging of per-joint box velocity
+    # limits. See ruckig_parametrize_path(uniform_path_speed=). Off by
+    # default here (time-optimal, historical); NOTE the SplatSim traj-gen
+    # side has defaulted to True since the vine-wobble diagnosis
+    # (2026-07-28) — enable this to match demos recorded with that default.
     rrt_uniform_path_speed: bool = False
+    # CHOMP-lite trajectory optimizer applied to the RRT path (after
+    # random-shortcut smoothing and optional elastic corner-rounding, before
+    # ruckig time-parametrization). Adds an EXPLICIT REPULSIVE collision cost
+    # — a hinge on min-signed-distance-to-obstacles that activates when a
+    # waypoint is within `rrt_trajopt_collision_threshold` meters of any
+    # obstacle. Combined with Laplacian smoothness this pushes waypoints
+    # AWAY from obstacles (not just refusing entry into collision), giving
+    # paths with genuinely wider clearance that trace the SAME homotopy
+    # class more consistently across small obstacle-position variations —
+    # reducing "boundary flip-flop" data noise for downstream imitation
+    # learning. See trajopt_smooth_path in SplatSim/splatsim/utils/
+    # rrt_path_utils.py for the cost formulation.
+    # Default 15 passes — enough for most of the clearance-widening benefit
+    # while keeping intervention plan cost modest (~1.5-2.5 s per plan on a
+    # 3-DoF arm). Set to 0 to disable; 30 for fully-converged optimization
+    # at ~2× the cost.
+    rrt_trajopt_passes: int = 15
+    rrt_trajopt_lr: float = 0.02
+    rrt_trajopt_smoothness_weight: float = 1.0
+    rrt_trajopt_collision_weight: float = 5.0
+    # Distance below which the soft collision cost activates (meters).
+    # Set to roughly half the link diameter as a starting value; smaller =
+    # tighter (paths hug obstacles closer), larger = more conservative
+    # (paths take wider berth, may be blocked in cluttered scenes).
+    rrt_trajopt_collision_threshold: float = 0.10
+    rrt_trajopt_fd_step: float = 0.01
     # If True (default), ruckig time-parametrization splits the smoothed RRT
     # path at sharp-angle waypoints (angle > 45°) and runs ruckig per-segment
     # with zero velocity at every sharp boundary — historical "stop-and-go"
@@ -480,8 +568,6 @@ class SharedAutonomyConfig:
             raise ValueError(
                 f"policy_guidance_action_buffer_size must be positive, got {self.policy_guidance_action_buffer_size}"
             )
-        if self.debug_maxlen <= 0:
-            raise ValueError(f"debug_maxlen must be positive, got {self.debug_maxlen}")
         valid_blend_modes = {"every_step", "once_per_chunk"}
         if self.blend_mode not in valid_blend_modes:
             raise ValueError(f"blend_mode must be one of {valid_blend_modes}, got '{self.blend_mode}'")
