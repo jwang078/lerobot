@@ -97,7 +97,7 @@ class FutureChunkConfig:
     #     only preempts the policy when its chunk would actually overlap
     #     the obstacle geometry.
     #   * If you specifically want the shield to be MORE conservative than
-    #     the env (e.g., to leave room for ruckig-smoothing-induced
+    #     the env (e.g., to leave room for parametrization-induced
     #     deviation), bump these explicitly to a small positive value
     #     (e.g. 0.005m for 5mm). Avoid setting > the planner's clearance
     #     — that contradicts the planning contract.
@@ -223,7 +223,7 @@ class SharedAutonomyConfig:
     # ticks and drowns the rest of the log; enable when debugging phantom
     # state / rel-action-postprocessor drift bugs.
     debug_rrt_drift_log: bool = False
-    # Control rate (Hz) used for ruckig time parametrization of RRT chunks.
+    # Control rate (Hz) used for TOPP-RA time parametrization of RRT chunks.
     # Should match the env's fps. Consulted on EVERY RRT plan (controller
     # triggers, the future-chunk shield, and the GUI's "RRT to Goal" button —
     # it's baked into the RRTToGoalPlanner at construction), and to convert
@@ -299,6 +299,21 @@ class SharedAutonomyConfig:
     #     aimed at the goal EE position.
     # None passes through to the planner's default (EE_ARC_LENGTH).
     rrt_path_selection: str | None = None
+    # Joint-arc regularizer ADDED to the base path score of whichever
+    # `rrt_path_selection` strategy is active (skipped when the strategy is
+    # already "joint_arc_length"). Units: base-score-units per rad — m/rad
+    # for the arc-length strategies. 0 (default) = off, exactly the
+    # historical score.
+    #
+    # Why: "ee_arc_length" is blind to joint-space distance. Near the goal a
+    # redundant DOF lets IK candidates differ by radians of joint travel
+    # while their EE arcs differ by millimeters, so the scorer picks slow,
+    # joint-churny winners — execution time under the parametrizer scales
+    # with JOINT arc length (joint vel/acc limits), not EE arc. A small
+    # weight (~0.02-0.05 m/rad) breaks those near-ties toward the
+    # fast-to-execute candidate without disturbing EE-arc ordering when EE
+    # arcs differ meaningfully.
+    rrt_path_score_joint_arc_weight: float = 0.0
     # IK-goal-selection strategy: scores AMONG the IK candidates BEFORE
     # running RRT, based on goal-state geometry alone (no planned path
     # needed). When set, the planner sorts candidates by this score,
@@ -425,7 +440,7 @@ class SharedAutonomyConfig:
     # Margin multiplier on the planner's obstacle clearance used by the
     # contact-normal escape (RRTToGoalPlanner._escape_collision) to set
     # how far past the BiRRT collision threshold the escape pushes before
-    # declaring "clear". 1.5× default = ~50% margin so subsequent ruckig
+    # declaring "clear". 1.5× default = ~50% margin so subsequent parametrized
     # motion doesn't immediately dip back into the threshold and trigger
     # the controller's per-tick check (cascade-retry symptom). Set to 1.0
     # to disable the margin (restores historical "escape stops exactly at
@@ -445,28 +460,69 @@ class SharedAutonomyConfig:
     rrt_rewind_clearance_factor: float | None = None
     # Final-approach taper for RRT intervention chunks (mirrors SplatSim's
     # TrajectoryGenModeConfig.final_approach_*, forwarded to
-    # ruckig_parametrize_path): the planned trajectory brakes to a stop this
+    # parametrize_path): the planned trajectory brakes to a stop this
     # many rad (joint-space L2) before the goal, then creeps the remainder at
     # the scaled-down vel/acc limits below. Without it, the time-optimal
     # profile brakes at max deceleration into the last sample and the
     # PD-tracked robot carries momentum PAST the goal — recorded intervention
     # chunks then teach the policy to overshoot, and would be inconsistent
     # with traj-gen demos (which taper by default). 0.0 disables.
-    rrt_final_approach_dist: float = 0.15
-    rrt_final_approach_vel_scale: float = 0.5
-    rrt_final_approach_acc_scale: float = 0.25
+    # Absolute per-joint kinematic ceilings handed to the planner's
+    # time-parametrization (ruckig `inp.max_velocity` / `max_acceleration`
+    # / `max_jerk`). None keeps the planner's own default for that limit
+    # (see `RRTToGoalPlanner.__init__` in splatsim.utils.rrt_to_goal —
+    # deliberately not copied here, those defaults change), so pre-existing
+    # checkpoints and commands are unaffected; passing a value equal to the
+    # current default is a no-op. Lower values make RRT chunks
+    # ramp more gently; jerk bounds how fast the acceleration itself can
+    # change, which is what smooths the corners of the velocity profile.
+    # Distinct from rrt_final_approach_{vel,acc}_scale, which are RELATIVE
+    # tapers applied only over the last stretch before the goal.
+    rrt_max_joint_vel: float | None = None
+    rrt_max_joint_acc: float | None = None
+    rrt_max_joint_jerk: float | None = None
+    # Random-shortcut smoothing iterations on each raw BiRRT path
+    # (pybullet_planning `smooth_path`). Each iteration picks two random
+    # points on the path and replaces the span between them with a straight
+    # joint-space segment when that is collision-free and shorter, which is
+    # what removes RRT's zigzags. Time parametrization CANNOT fix a wiggly
+    # path — it only decides how fast to traverse the given geometry — so
+    # leftover detours survive as direction changes, and every direction
+    # change forces a decelerate/re-accelerate that shows up as jerk.
+    # None keeps the planner default (50). SplatSim's trajectory-generation
+    # config uses 200; matching it here makes intervention paths as straight
+    # as the recorded demos. Iterations past convergence are nearly free (a
+    # candidate is collision-checked only when it would shorten the path).
+    rrt_smooth_iterations: int | None = None
+    # Corner-rounding relaxation (SplatSim rrt_path_utils.elastic_smooth_path)
+    # applied to the WINNING path after trajopt, before time parametrization
+    # — the same order trajectory-gen uses (TrajectoryGenModeConfig default
+    # 30), and for the same reason: trajopt's finite-difference repulsion
+    # leaves waypoint-scale jitter, worst when its RDP decimation falls back
+    # to the raw dense optimizer output (up to ~70 waypoints ~0.04 rad
+    # apart). The parametrizer follows that geometry faithfully, braking at
+    # every micro-corner: measured 10-80x more >=3Hz velocity energy in
+    # intervention chunks than in traj-gen demos, plus up to ~3x longer
+    # chunks. Elastic irons the jitter out (measured back to traj-gen
+    # smoothness). Runs once per plan on the selected candidate only.
+    # None keeps the planner default (30 since 2026-08-14; previously 0,
+    # which is what caused the wiggle).
+    rrt_elastic_smooth_passes: int | None = None
+    rrt_final_approach_dist: float | None = None
+    rrt_final_approach_vel_scale: float | None = None
+    rrt_final_approach_acc_scale: float | None = None
     # Equalize joint-space path speed across RRT path sections (mirrors
     # SplatSim's TrajectoryGenModeConfig.uniform_path_speed so intervention
     # chunks and traj-gen demos can share the same execution-speed profile).
     # Removes the direction-anisotropy surging of per-joint box velocity
-    # limits. See ruckig_parametrize_path(uniform_path_speed=). Off by
+    # limits. See parametrize_path(uniform_path_speed=). Off by
     # default here (time-optimal, historical); NOTE the SplatSim traj-gen
     # side has defaulted to True since the vine-wobble diagnosis
     # (2026-07-28) — enable this to match demos recorded with that default.
-    rrt_uniform_path_speed: bool = False
+    rrt_uniform_path_speed: bool | None = None
     # CHOMP-lite trajectory optimizer applied to the RRT path (after
     # random-shortcut smoothing and optional elastic corner-rounding, before
-    # ruckig time-parametrization). Adds an EXPLICIT REPULSIVE collision cost
+    # TOPP-RA time-parametrization). Adds an EXPLICIT REPULSIVE collision cost
     # — a hinge on min-signed-distance-to-obstacles that activates when a
     # waypoint is within `rrt_trajopt_collision_threshold` meters of any
     # obstacle. Combined with Laplacian smoothness this pushes waypoints
@@ -480,29 +536,41 @@ class SharedAutonomyConfig:
     # while keeping intervention plan cost modest (~1.5-2.5 s per plan on a
     # 3-DoF arm). Set to 0 to disable; 30 for fully-converged optimization
     # at ~2× the cost.
-    rrt_trajopt_passes: int = 15
-    rrt_trajopt_lr: float = 0.02
-    rrt_trajopt_smoothness_weight: float = 1.0
-    rrt_trajopt_collision_weight: float = 5.0
+    # ── Planner smoothing/parametrization knobs: None = INHERIT ──────────
+    # None means "use the planner's default", and the planner's defaults come
+    # from ONE canonical place shared with trajectory generation:
+    # SplatSim's splatsim/configs/planner_defaults.py. Set a value here ONLY
+    # to deliberately diverge interventions from the demo pipeline. (These
+    # used to carry their own copies of the numbers; they drifted — e.g.
+    # elastic_smooth_passes 0-vs-30 — and the drift shipped speed judder into
+    # recorded DAgger chunks.)
+    rrt_trajopt_passes: int | None = None
+    rrt_trajopt_lr: float | None = None
+    rrt_trajopt_smoothness_weight: float | None = None
+    rrt_trajopt_collision_weight: float | None = None
     # Distance below which the soft collision cost activates (meters).
     # Set to roughly half the link diameter as a starting value; smaller =
     # tighter (paths hug obstacles closer), larger = more conservative
     # (paths take wider berth, may be blocked in cluttered scenes).
-    rrt_trajopt_collision_threshold: float = 0.10
-    rrt_trajopt_fd_step: float = 0.01
-    # If True (default), ruckig time-parametrization splits the smoothed RRT
-    # path at sharp-angle waypoints (angle > 45°) and runs ruckig per-segment
-    # with zero velocity at every sharp boundary — historical "stop-and-go"
-    # behavior. If False, ruckig is invoked once across the full path with
-    # intermediate_positions, optimizing corner deceleration internally
-    # without forced zero-velocity stops. Empirical comparison on
-    # lever-grasp interventions (d5_fast_03dag vs d5jvm_g0_03dag,
-    # 2026-06-10) showed no observable trajectory-duration difference
-    # between the two modes — typical manipulation RRT plans don't have
-    # enough sharp corners for the segmentation to matter. True is the
-    # conservative default; flip to False only for stress-testing paths
-    # with many sharp corners or matching legacy recordings.
-    rrt_segment_at_sharp_corners: bool = True
+    rrt_trajopt_collision_threshold: float | None = None
+    rrt_trajopt_fd_step: float | None = None
+    # What happens at RRT-path corners during time parametrization.
+    # False (default) — CARRY SPEED: corners are rounded within a small
+    # joint-space deviation budget (SplatSim rrt_path_utils._blend_corners,
+    # 0.05 rad) and the path is parametrized as one continuous problem, so
+    # intervention chunks flow through waypoints near cruise speed instead of
+    # braking to ~0 at each one. Rounding is what actually implements this:
+    # a trajectory pinned to the exact polyline must stop at sharp corners
+    # regardless of segmentation. Near-reversals (>150°) still brake — a
+    # joint whose velocity reverses must pass through zero. True — STOP at
+    # sharp (>45°) corners: split into per-segment problems with zero
+    # boundary velocity; the executed path stays exactly on the
+    # collision-checked chords at those corners, at the cost of bursty
+    # stop-and-go motion. Default False since 2026-08-13, matching
+    # trajectory-gen (TrajectoryGenModeConfig.segment_at_sharp_corners) so
+    # intervention chunks and demos share one speed profile; existing run
+    # commands that pass =false explicitly are unaffected.
+    rrt_segment_at_sharp_corners: bool | None = None
     # Diagnostic dump for MIN_PAIR_CLEARANCE path scoring. Controls whether
     # `_path_min_pair_clearance` prints a table of all non-adjacent link
     # pairs (sorted by min distance, with min/max/range columns + a
@@ -528,7 +596,7 @@ class SharedAutonomyConfig:
     # waypoint||. On clean execution this stays ~0.03 rad; when the arm wedges
     # against geometry (lever / target object / a contact the env's
     # penetration-only `in_collision` flag misses) the joint stalls while the
-    # open-loop ruckig command marches on, and drift grows monotonically to
+    # open-loop commanded marches on, and drift grows monotonically to
     # 1+ rad. That runaway gets recorded as a (state, action) pair off-manifold
     # by ~1.5 rad, which is corrosive to DAgger training. When drift exceeds
     # `rrt_abort_on_drift_rad` for `rrt_abort_on_drift_ticks` CONSECUTIVE ticks,

@@ -33,7 +33,7 @@ import logging
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -1032,6 +1032,15 @@ def train(cfg: TrainPipelineConfig):
     if _obs_noise_std and is_main_process:
         logging.info(f"[train] observation noise enabled: {_obs_noise_std}")
 
+    # Eval envs live for the whole RUN, not per-eval. Building the sim is
+    # expensive, and tearing it down mid-training is what triggers the
+    # PyBullet/Tcl `Tcl_AsyncDelete` SIGABRT — which, if it fires between
+    # evals, kills training before the final checkpoint exists. Created
+    # lazily on the first eval so eval-less runs never build a sim, and
+    # closed once at the end of train().
+    _eval_envs_stack = ExitStack()
+    _eval_envs: dict[str, dict[int, Any]] = {}
+
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
         batch = next(dl_iter)
@@ -1240,7 +1249,10 @@ def train(cfg: TrainPipelineConfig):
                 if use_ema_for_eval:
                     logging.info("Evaluating the EMA weights")
                 weights_cm = _ema_weights(ema, eval_policy_model) if use_ema_for_eval else nullcontext()
-                with weights_cm, _make_eval_envs(cfg) as eval_env, torch.no_grad(), accelerator.autocast():
+                if not _eval_envs:
+                    _eval_envs.update(_eval_envs_stack.enter_context(_make_eval_envs(cfg)))
+                eval_env = _eval_envs
+                with weights_cm, torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_env,  # dict[suite][task_id] -> vec_env
                         policy=eval_policy_model,
@@ -1368,6 +1380,10 @@ def train(cfg: TrainPipelineConfig):
                 logging.warning("Failed to push EMA weights to %s: %s", ema_repo_id, exc)
             finally:
                 unwrapped.config.repo_id = orig_repo_id
+
+    # Close eval envs only now that the final checkpoint is on disk, so a
+    # teardown abort can no longer cost us the run.
+    _eval_envs_stack.close()
 
     # Properly clean up the distributed process group
     accelerator.wait_for_everyone()

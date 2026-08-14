@@ -181,7 +181,7 @@ class TeleopRecordingContext:
         # Why we ALSO need the recorder-side threshold check below: this
         # signal only covers LEROBOT-driven teleports. PyBullet's
         # constraint solver applies position corrections when the robot
-        # link physically penetrates an obstacle during ruckig-smoothed
+        # link physically penetrates an obstacle during time-parametrized
         # RRT execution — those state jumps come from env physics, never
         # touch any of our code, and so can't be source-signaled. The
         # recorder-side threshold check at TeleopRecording.step() catches
@@ -201,7 +201,7 @@ class TeleopRecordingContext:
         # Any inter-frame Δstate > this threshold ends the prior episode
         # there, no exceptions.
         #
-        # Default 0.15 rad/frame ≈ 4.5 rad/s at 30 Hz, well above ruckig-
+        # Default 0.15 rad/frame ≈ 4.5 rad/s at 30 Hz, well above parametrizer-
         # bounded RRT motion (~0.1 rad/frame max) but below typical
         # teleport magnitudes (~0.3-3 rad). Set to 0 to disable.
         self.state_jump_split_threshold_rad: float = 0.15
@@ -418,7 +418,7 @@ class TeleopRecordingWrapper(gym.Wrapper):
 
         # 3. Drop the first ``extra_leading`` real frames to suppress
         # velocity-from-rest artifacts at RRT segment onset (e.g. when
-        # the trigger reason rewinds via lookback + ruckig start_vel=0).
+        # the trigger reason rewinds via lookback + start_vel=0).
         n_onset = 0
         if extra_leading > 0:
             n_onset = min(end - start, extra_leading)
@@ -728,7 +728,7 @@ class TeleopRecordingWrapper(gym.Wrapper):
             # Recorder-side state-discontinuity detection. Historically
             # this ALSO split the episode on the theory that PyBullet's
             # constraint-solver position corrections (kicked in when the
-            # ruckig-smoothed RRT chunk grazes/penetrates an obstacle)
+            # time-parametrized RRT chunk grazes/penetrates an obstacle)
             # would pollute rel-action stats for the straddling chunk if
             # left inside one episode. In practice the split produced
             # confusing "one RRT plan → three episode segments, two of

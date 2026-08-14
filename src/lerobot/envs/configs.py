@@ -791,13 +791,13 @@ class SplatSimEnv(EnvConfig):
     # teleports (lookback rewind, escape from q_start-in-collision,
     # request_retry_after_collision). It cannot cover PyBullet's
     # constraint-solver position corrections — those fire when a robot
-    # link physically penetrates an obstacle during ruckig-smoothed RRT
+    # link physically penetrates an obstacle during time-parametrized RRT
     # execution (env-physics, never touches our code), and produce
     # multi-rad state jumps with no source-side hook to signal them.
     # The recorder-side threshold check IS the only mechanism that can
     # split on those.
     #
-    # Default 0.15 rad/frame sits between ruckig-bounded RRT motion
+    # Default 0.15 rad/frame sits between parametrizer-bounded RRT motion
     # (~0.1 rad/frame max) and typical teleport / collision-correction
     # magnitudes (~0.3-3 rad). Set to 0 to disable (source-side signal
     # still applies). Tighten if your recorded data still shows

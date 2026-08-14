@@ -53,7 +53,7 @@ class InterventionConfig:
     policy_steps_between_rrt_max: int = 120
     # When True, SCHEDULED cadence triggers ("time stall": the
     # policy_steps_before/between_rrt budget elapsing, NOT an actual stall)
-    # take the no-lookback path: RRT plans from the LIVE state with ruckig
+    # take the no-lookback path: RRT plans from the LIVE state with time parametrization
     # seeded from the robot's recent velocity, so the recorded correction
     # starts velocity-continuous (decelerate-and-redirect) instead of the
     # rewind+teleport+cold-start of the lookback path. The scheduled trigger
@@ -158,7 +158,7 @@ class InterventionConfig:
     # trigger (which is disabled by default; window=0).
     #
     # Fires on POLICY mode only (mode == IDLE). During RRT execution the
-    # counter is reset — Ruckig's smooth deceleration near a waypoint would
+    # counter is reset — the parametrizer's smooth deceleration near a waypoint would
     # otherwise misfire.
     #
     # Uses its own threshold (not stuck_threshold_rad_per_tick) so the wedge
@@ -167,7 +167,7 @@ class InterventionConfig:
     # produces the same joint config forever".
     #
     # Disabled by default (window=0). Recommended starting values when
-    # enabling: window=60 (≈2 s at 30 Hz — long enough to let Ruckig's
+    # enabling: window=60 (≈2 s at 30 Hz — long enough to let the parametrizer's
     # goal-tail deceleration and momentary pauses pass without misfiring),
     # threshold=0.005 rad/tick (same magnitude as the wedge gate default).
     joint_stall_window_steps: int = 0

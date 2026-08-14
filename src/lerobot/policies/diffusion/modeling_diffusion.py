@@ -318,9 +318,13 @@ class DiffusionModel(nn.Module):
                 t_next = timesteps[i + 1] if i + 1 < len(timesteps) else None
                 if t_next is not None:
                     t_tensor = torch.full((batch_size,), t_next, dtype=torch.long, device=sample.device)
-                    noisy = self.noise_scheduler.add_noise(
-                        anchor_action, torch.randn_like(anchor_action), t_tensor
+                    anchor_noise = torch.randn(
+                        anchor_action.shape,
+                        dtype=anchor_action.dtype,
+                        device=anchor_action.device,
+                        generator=generator,
                     )
+                    noisy = self.noise_scheduler.add_noise(anchor_action, anchor_noise, t_tensor)
                     sample[:, act_start : act_start + n_a, :] = noisy
 
         return sample
@@ -369,6 +373,7 @@ class DiffusionModel(nn.Module):
         noise: Tensor | None = None,
         sa_noise_ratio: float | None = None,
         anchor_action: Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> Tensor:
         """
         This function expects `batch` to have:
@@ -390,6 +395,7 @@ class DiffusionModel(nn.Module):
         actions = self.conditional_sample(
             batch_size,
             global_cond=global_cond,
+            generator=generator,
             noise=noise,
             sa_noise_ratio=sa_noise_ratio,
             anchor_action=anchor_action,

@@ -71,6 +71,12 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    # Deterministic sampling: when set, the initial flow-matching noise draw
+    # and the anchor-inpainting noise use this generator instead of the global
+    # RNG (SA wrapper's `sample_seed` — see SharedAutonomyPolicyWrapper.
+    # build_sample_generator). The Euler integration itself is deterministic,
+    # so pinning these two draws makes the whole sample deterministic.
+    generator: torch.Generator | None
 
 
 # Define the complete layer computation function for gradient checkpointing
@@ -637,6 +643,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         bsize = tokens.shape[0]
         device = tokens.device
 
+        generator: torch.Generator | None = kwargs.get("generator")
         if noise is None:
             # Sample noise with padded dimension as expected by action_in_proj
             actions_shape = (
@@ -644,7 +651,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 self.config.chunk_size,
                 self.config.max_action_dim,
             )  # Use config max_action_dim for internal processing
-            noise = self.sample_noise(actions_shape, device)
+            if generator is not None:
+                noise = torch.randn(actions_shape, dtype=torch.float32, device=device, generator=generator)
+            else:
+                noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -668,7 +678,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         anchor_action: Tensor | None = kwargs.get("anchor_action")
         # Sample anchor noise ONCE outside the ODE loop so all steps stay on the same
         # flow trajectory (re-sampling per step would cause chaotic velocity fields).
-        anchor_noise = torch.randn_like(anchor_action) if anchor_action is not None else None
+        anchor_noise = (
+            torch.randn(
+                anchor_action.shape,
+                dtype=anchor_action.dtype,
+                device=anchor_action.device,
+                generator=generator,
+            )
+            if anchor_action is not None
+            else None
+        )
         sa_noise_ratio = kwargs.get("sa_noise_ratio")
         if sa_noise_ratio is not None and noise is not None:
             # Shared autonomy: noise already contains partially-noised human action,
