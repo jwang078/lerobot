@@ -263,6 +263,102 @@ class DiffusionModel(nn.Module):
             self.num_inference_steps = config.num_inference_steps
 
     # ========= inference  ============
+    def _rtc_guided_model_output(
+        self,
+        sample: Tensor,
+        t: Tensor,
+        global_cond: Tensor | None,
+        rtc_prev_chunk: Tensor,
+        rtc_prefix_weights: Tensor,
+        rtc_max_guidance_weight: float,
+        act_start: int,
+    ) -> Tensor:
+        """UNet forward + RTC-style prev-chunk gradient guidance (DDPM analog
+        of ``RTCProcessor.denoise_step``, see lerobot/policies/rtc/).
+
+        Computes the clean-chunk estimate ``x0_hat`` from the model output,
+        forms the prefix-weighted error toward the previous chunk's unexecuted
+        leftover, backprops it through the UNet to get a correction in
+        ``x_t``-space (vector-Jacobian product, exactly as RTC does for flow
+        velocities), and folds ``guidance_weight * correction`` back into the
+        model output so the scheduler step lands closer to the previous
+        chunk's mode. The guidance-weight schedule ports RTC's formula with
+        flow time replaced by DDPM progress ``tau = 1 - t/num_train_timesteps``
+        (strongly clamped by ``rtc_max_guidance_weight`` at both ends).
+
+        ``rtc_prev_chunk``: (B, L, A) normalized actions, index 0 = the action
+        for the CURRENT tick (horizon position ``act_start``).
+        ``rtc_prefix_weights``: (L,) prefix-attention weights (1 → hard
+        commit, 0 → unconstrained tail).
+        """
+        prediction_type = self.noise_scheduler.config.prediction_type
+        if prediction_type not in ("epsilon", "sample"):
+            raise NotImplementedError(
+                f"rtc_prev_chunk guidance supports prediction_type 'epsilon'/'sample', got {prediction_type}"
+            )
+        abar = float(self.noise_scheduler.alphas_cumprod[int(t)])
+        if abar < 1e-3:
+            # Near-pure-noise steps (only reached when denoising starts close
+            # to full noise, i.e. sa_noise_ratio ≳ 0.95): x0_hat AND its VJP
+            # each scale as 1/sqrt(abar) (abar ~ 2e-7 at the last
+            # squaredcos_cap_v2 step), so the folded correction amplifies as
+            # ~guidance_weight/abar per step. With clip_sample=False nothing
+            # bounds it, and because the exploded chunk becomes the NEXT
+            # chunk's RTC target, magnitudes compound across ticks to float32
+            # overflow → NaN. x0_hat carries essentially no mode information
+            # at these steps anyway, so skip the guidance below this floor.
+            return self.unet(
+                sample,
+                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                global_cond=global_cond,
+            )
+        sqrt_abar = abar**0.5
+        sqrt_one_minus_abar = (1.0 - abar) ** 0.5
+
+        horizon = sample.shape[1]
+        n_l = min(rtc_prev_chunk.shape[1], horizon - act_start)
+        target = torch.zeros_like(sample)
+        target[:, act_start : act_start + n_l, :] = rtc_prev_chunk[:, :n_l, :].to(sample.dtype)
+        weights = torch.zeros(1, horizon, 1, dtype=sample.dtype, device=sample.device)
+        weights[0, act_start : act_start + n_l, 0] = (
+            rtc_prefix_weights[:n_l].to(sample.dtype).to(sample.device)
+        )
+
+        with torch.enable_grad():
+            x_in = sample.clone().detach().requires_grad_(True)
+            model_output = self.unet(
+                x_in,
+                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                global_cond=global_cond,
+            )
+            if prediction_type == "epsilon":
+                x0_hat = (x_in - sqrt_one_minus_abar * model_output) / max(sqrt_abar, 1e-8)
+            else:  # "sample"
+                x0_hat = model_output
+            err = (target - x0_hat) * weights
+            correction = torch.autograd.grad(x0_hat, x_in, grad_outputs=err.detach(), retain_graph=False)[0]
+        model_output = model_output.detach()
+        correction = correction.detach()
+
+        # RTC's guidance-weight schedule with tau := DDPM denoising progress.
+        max_gw = torch.as_tensor(rtc_max_guidance_weight, dtype=sample.dtype)
+        tau = torch.as_tensor(
+            1.0 - float(t) / float(self.noise_scheduler.config.num_train_timesteps), dtype=sample.dtype
+        )
+        squared_one_minus_tau = (1 - tau) ** 2
+        inv_r2 = (squared_one_minus_tau + tau**2) / squared_one_minus_tau
+        c = torch.nan_to_num((1 - tau) / tau, posinf=float(max_gw))
+        guidance_weight = torch.nan_to_num(c * inv_r2, posinf=float(max_gw))
+        guidance_weight = float(torch.minimum(guidance_weight, max_gw))
+
+        # Fold the x0-space push into the model output so `scheduler.step`
+        # needs no changes: epsilon-pred x0 shifts by -sqrt(1-abar)/sqrt(abar)
+        # per unit epsilon, so the exact inverse scaling lands x0_hat at
+        # x0_hat + guidance_weight * correction.
+        if prediction_type == "epsilon":
+            return model_output - guidance_weight * correction * (sqrt_abar / max(sqrt_one_minus_abar, 1e-8))
+        return model_output + guidance_weight * correction
+
     def conditional_sample(
         self,
         batch_size: int,
@@ -271,6 +367,9 @@ class DiffusionModel(nn.Module):
         noise: Tensor | None = None,
         sa_noise_ratio: float | None = None,
         anchor_action: Tensor | None = None,
+        rtc_prev_chunk: Tensor | None = None,
+        rtc_prefix_weights: Tensor | None = None,
+        rtc_max_guidance_weight: float = 10.0,
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -302,12 +401,25 @@ class DiffusionModel(nn.Module):
         act_start = self.config.n_obs_steps - 1  # action steps begin here in the sample tensor
 
         for i, t in enumerate(timesteps):
-            # Predict model output.
-            model_output = self.unet(
-                sample,
-                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
-                global_cond=global_cond,
-            )
+            # Predict model output — with RTC-style prev-chunk gradient
+            # guidance when a leftover chunk was provided (the guided branch
+            # runs the SAME unet forward, plus a backward for the correction).
+            if rtc_prev_chunk is not None and rtc_prefix_weights is not None:
+                model_output = self._rtc_guided_model_output(
+                    sample,
+                    t,
+                    global_cond,
+                    rtc_prev_chunk,
+                    rtc_prefix_weights,
+                    rtc_max_guidance_weight,
+                    act_start,
+                )
+            else:
+                model_output = self.unet(
+                    sample,
+                    torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                    global_cond=global_cond,
+                )
             # Compute previous image: x_t -> x_t-1
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
 
@@ -374,6 +486,9 @@ class DiffusionModel(nn.Module):
         sa_noise_ratio: float | None = None,
         anchor_action: Tensor | None = None,
         generator: torch.Generator | None = None,
+        rtc_prev_chunk: Tensor | None = None,
+        rtc_prefix_weights: Tensor | None = None,
+        rtc_max_guidance_weight: float = 10.0,
     ) -> Tensor:
         """
         This function expects `batch` to have:
@@ -399,6 +514,9 @@ class DiffusionModel(nn.Module):
             noise=noise,
             sa_noise_ratio=sa_noise_ratio,
             anchor_action=anchor_action,
+            rtc_prev_chunk=rtc_prev_chunk,
+            rtc_prefix_weights=rtc_prefix_weights,
+            rtc_max_guidance_weight=rtc_max_guidance_weight,
         )
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
