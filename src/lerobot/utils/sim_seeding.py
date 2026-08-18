@@ -77,6 +77,7 @@ def seed_splatsim_env_to_state(
     vec_env: gym.vector.VectorEnv,
     *,
     joint_state: np.ndarray | None = None,
+    joint_velocities: np.ndarray | list | None = None,
     num_dofs: int = 6,
     seed: list[int] | None = None,
     benchmark_start_index: int | None = None,
@@ -147,7 +148,22 @@ def seed_splatsim_env_to_state(
         if hasattr(robot_server, "teleport_joint_state") and hasattr(robot_server, "splatsim_robot"):
             js = np.asarray(joint_state, dtype=np.float64).reshape(-1)
             n_set = min(js.shape[0], num_dofs + 1)
-            robot_server.teleport_joint_state(robot_server.splatsim_robot, js[:n_set].tolist())
+            if joint_velocities is not None:
+                # Velocity-preserving teleport (resetJointState targetVelocity
+                # on the server): a blend rollout seeding an intervention
+                # episode's start state must also restore the velocity the
+                # policy handed off — a rest-seeded robot lurches at its
+                # first command and its obs history contradicts the source
+                # episode's moving handoff. Older backends without the
+                # parameter fall back to position-only.
+                jv = np.asarray(joint_velocities, dtype=np.float64).reshape(-1)[:n_set].tolist()
+                try:
+                    robot_server.teleport_joint_state(robot_server.splatsim_robot, js[:n_set].tolist(), jv)
+                except TypeError:
+                    logging.debug("teleport_joint_state lacks joint_velocities — position-only seed.")
+                    robot_server.teleport_joint_state(robot_server.splatsim_robot, js[:n_set].tolist())
+            else:
+                robot_server.teleport_joint_state(robot_server.splatsim_robot, js[:n_set].tolist())
             raw_obs = robot_server.get_observations()
             if hasattr(base_env, "_to_gym_obs"):
                 env_obs = _add_batch_dim(base_env._to_gym_obs(raw_obs))
