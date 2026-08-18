@@ -683,12 +683,11 @@ def rollout(
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
 
-    # ── intervention-mode post-rollout: commit/discard + CSV row ─────────── #
-    # Reads ``all_successes`` to determine the scenario verdict. If the env
-    # reported success at any point during the rollout, commit the buffered
-    # episodes (the recorder accumulated them under teleop_ctx with
-    # defer_episode_saves=True). Otherwise discard them so failed-correction
-    # frames don't pollute the DAgger dataset.
+    # ── intervention-mode post-rollout: commit + CSV row ─────────────────── #
+    # Reads ``all_successes`` for the scenario verdict (CSV bookkeeping).
+    # Buffered episodes (accumulated under teleop_ctx with
+    # defer_episode_saves=True) are committed regardless of the verdict —
+    # see the rationale at the commit call below.
     if intervention_ctx is not None:
         # ``all_successes`` is a list of [B]-shaped tensors; we have B==1 so
         # check if any tick reported success.
@@ -703,25 +702,31 @@ def rollout(
         except Exception:
             logging.exception("flush_in_progress_episode failed during intervention rollout cleanup.")
 
-        if scn_success:
-            n_committed_list = env.call("commit_pending_episodes")
-            n_committed = int(sum(n_committed_list)) if n_committed_list else 0
-        else:
-            env.call("discard_pending_episodes")
-            n_committed = 0
+        # Commit UNCONDITIONALLY — including failed scenarios. Each recorded
+        # chunk is RRT expert data that reached its own local goal; its
+        # validity does not depend on whether the POLICY later completed the
+        # scenario between interventions. The old success-gated commit
+        # silently created survivorship bias: the hardest scenarios (the
+        # exact states DAgger exists to supervise) contributed ZERO data
+        # because the weak policy kept them from ever finishing — measured
+        # 2026-08-18: scenario 11's first-ever wrap-around recovery chunks
+        # (5 episodes, 619 frames) discarded on max_cycles_reached.
+        n_committed_list = env.call("commit_pending_episodes")
+        n_committed = int(sum(n_committed_list)) if n_committed_list else 0
         intervention_ctx.n_committed_episodes += n_committed
 
         ctrl = intervention_ctx.controller
         _resolved_idx = intervention_ctx.resolve_scenario_idx(intervention_ctx.scenario_idx)
         logging.info(
-            "Scenario %d (benchmark ep %d) finished: success=%s cycles=%d status=%s (%d episode(s) %s)",
+            "Scenario %d (benchmark ep %d) finished: success=%s cycles=%d status=%s "
+            "(%d episode(s) committed%s)",
             intervention_ctx.scenario_idx,
             _resolved_idx,
             scn_success,
             ctrl.cycles_used,
             ctrl.last_status,
-            n_committed if scn_success else ctrl.cycles_used,
-            "committed" if scn_success else "discarded",
+            n_committed,
+            "" if scn_success else " from FAILED scenario — chunks are still expert data",
         )
         intervention_ctx.record_scenario_result(intervention_ctx.scenario_idx, scn_success)
         # Advance the counter for the next rollout() call (next scenario).
