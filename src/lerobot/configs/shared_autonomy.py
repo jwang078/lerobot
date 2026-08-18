@@ -29,10 +29,17 @@ conformity (following learned behavior distribution):
   guidance action VERBATIM (teleop passthrough); no denoising runs.
 - forward_flow_ratio = 0.4: moderate blend — x_tsw = 0.4·noise + 0.6·guidance
   (guidance-leaning; LOWER ratio = MORE guidance influence).
-- forward_flow_ratio = 1.0: pure policy — x_tsw is (almost) all noise, so a
-  full-length denoise ≈ the policy's own sample; guidance contributes ~nothing
-  ("blend100"). Applies to the obs-teleop blending path only: RRT and
-  oracle-goal chunks play verbatim regardless of this ratio.
+- forward_flow_ratio = 1.0: pure policy ("blend100") — the obs-teleop source
+  BYPASSES the blend machinery entirely and emits plain unguided inner-policy
+  chunks at the blend cadence (no guidance encode, no x_tsw, no RTC, no
+  n_anchor_steps). Ratio 1.0 must NEVER route through DENOISE/INTERPOLATE:
+  the 0-weight guidance term still propagates NaN (0·NaN), and a full-noise
+  denoise start executes the near-zero-alpha_bar timesteps where in-loop
+  corrections (rtc_prev_chunk_guidance) diverge — see the ratio>=1.0 branch
+  in ObservationTeleopGuidanceSource._build_and_emit_blended.
+
+All three ratio regimes apply to the obs-teleop blending path only: RRT and
+oracle-goal chunks play verbatim regardless of this ratio.
 """
 
 from dataclasses import dataclass, field
@@ -147,11 +154,18 @@ class SharedAutonomyConfig:
     policy_guidance_action_buffer_size: int = 1
     apply_to_first_action_only: bool = True
     show_slider: bool = True  # launch a Tkinter slider to adjust forward_flow_ratio live
-    # Open the wrapper's own pybullet window even when show_slider is False.
-    # show_slider historically gated BOTH the Tk slider AND p.GUI vs p.DIRECT;
-    # headless pipelines (e.g. augment_dataset_with_blending) that want the
-    # guidance-ghost visualization need the window WITHOUT the slider thread.
-    pybullet_gui: bool = False
+    # Tri-state override for the wrapper's own pybullet window (p.GUI vs
+    # p.DIRECT). None (default) = legacy behavior: follow show_slider.
+    # True = open the window even when show_slider is False (headless
+    # pipelines like augment_dataset_with_blending that want the
+    # guidance-ghost visualization WITHOUT the slider thread).
+    # False = force p.DIRECT even when show_slider is True (headless
+    # orchestrator runs with --keep_sa_gui: Tk ratio slider only, no
+    # RRT-planner pybullet window). NOTE: checkpoints saved before the
+    # tri-state serialize `false` here; loading one alongside
+    # show_slider=true now yields slider-without-window — pass
+    # pybullet_gui=true explicitly if you want the window back.
+    pybullet_gui: bool | None = None
     start_paused: bool = False  # start with policy paused (unpause via GUI button)
     # Robot splat name — resolves to a URDF via SplatObjectConfig.
     # `None` (default) = auto-detect from the env's oracle_env_config on the
@@ -180,6 +194,34 @@ class SharedAutonomyConfig:
     # k steps are snapped to guidance post-hoc after the linear mix (no sampler to
     # re-anchor inside).
     n_anchor_steps: int = 0
+    # ── RTC-style previous-chunk guidance (additive; DENOISE strategy) ─────
+    # Real-Time Chunking (Physical Intelligence; see lerobot/policies/rtc/)
+    # conditions each freshly generated chunk on the UNEXECUTED REMAINDER of
+    # the previous chunk, so consecutive chunks commit to the same mode
+    # instead of splicing independent samples (the cross-chunk jitter of
+    # EVERY_STEP re-blends). When enabled, the obs-teleop blend path passes
+    # the previous blended chunk's leftover into the denoiser, which applies
+    # a gradient-guidance correction at every denoising step (a DDPM analog
+    # of RTCProcessor.denoise_step — diffusion inner policies only).
+    # COMPOSES WITH, does not replace, the x_tsw noise-then-denoise blend:
+    # forward_flow_ratio keeps its exact meaning (how much of the denoise the
+    # policy owns vs the expert guidance); this only adds a consistency pull
+    # toward the previous chunk. Under INTERPOLATE the glass-box analog is a
+    # prefix-weighted linear mix toward the previous chunk's leftover.
+    rtc_prev_chunk_guidance: bool = False
+    # Clamp on the per-denoise-step guidance weight (RTCConfig.max_guidance_weight).
+    rtc_max_guidance_weight: float = 10.0
+    # Steps of the new chunk over which the prefix weights anneal → 0.
+    # None = n_action_steps. Positions beyond this are unconstrained (the
+    # policy may re-plan the far future freely — RTC's "free tail").
+    rtc_execution_horizon: int | None = None
+    # Steps at the start of the new chunk that get weight 1.0 (hard commit).
+    # RTC uses the inference latency here; the SA blend is synchronous so the
+    # default is 0 (annealed weights from position 0, no frozen prefix).
+    rtc_inference_delay: int = 0
+    # Prefix weight schedule along the chunk: "linear", "exp", "zeros", "ones"
+    # (see RTCAttentionSchedule / RTCProcessor.get_prefix_weights).
+    rtc_prefix_attention_schedule: str = "linear"
     # Consumed only by the PI0.5-specific shared-autonomy path
     # (policies/pi05/modeling_shared_autonomy.py), NOT by
     # SharedAutonomyPolicyWrapper.
@@ -313,6 +355,19 @@ class SharedAutonomyConfig:
     # weight (~0.02-0.05 m/rad) breaks those near-ties toward the
     # fast-to-execute candidate without disturbing EE-arc ordering when EE
     # arcs differ meaningfully.
+    # Camera-aware hybrid path selection — SAME semantics as trajectory
+    # generation's TrajectoryGenModeConfig fields (splatsim). Interventions
+    # and demo generation share one planner implementation; these existed
+    # only on the generation side for a while, which meant intervention RRT
+    # silently lacked camera scoring. None = inherit the env's trajectory
+    # generation config (configs/traj_configs/<robot>.json — the LOWEST
+    # priority layer; anything set here or by the user overrides it), which
+    # then falls through to the planner default (0 = disabled).
+    rrt_camera_score_weight: float | None = None
+    rrt_ik_camera_weight: float | None = None
+    # Link name resolved to an index on the SA wrapper's pybullet robot; the
+    # camera terms are no-ops when the URDF has no such link.
+    rrt_wrist_camera_link_name: str | None = "wrist_camera_link"
     rrt_path_score_joint_arc_weight: float = 0.0
     # IK-goal-selection strategy: scores AMONG the IK candidates BEFORE
     # running RRT, based on goal-state geometry alone (no planned path
@@ -332,6 +387,24 @@ class SharedAutonomyConfig:
     # None (default) → no IK pre-selection; multi-candidate path scoring
     # via `rrt_path_selection` runs as before.
     rrt_ik_goal_selection: str | None = None
+    # Acceptance gate on rrt_ik_goal_selection's first-success-wins early
+    # exit. Without it, "take the first IK whose plan succeeds" means the
+    # path score NEVER arbitrates across IK branches: if the direct branch
+    # fails planning (collision-history exclusion, strict clearances at the
+    # goal, or plain RRT bad luck), the next branch — possibly a mirrored-
+    # elbow config whose every path loops the EE around the workspace —
+    # wins unconditionally, and the loop gets recorded as intervention data
+    # (observed: planar dag1 ep with EE arc 10x the straight-line chord).
+    # With the gate, the first IK's path early-exits only when its EE arc
+    # <= ratio * chord + 0.05 m slack; otherwise it's kept as fallback and
+    # the remaining IK branches are tried, best path score winning. Only
+    # consulted when rrt_ik_goal_selection is set. None = legacy
+    # unconditional early exit.
+    # 2.0 (was 3.0): shield replans from wedged states produced 2-3x
+    # arc/chord loops that the 3.0 gate waved through (measured 1.58 m arc on
+    # a 0.55 m chord); at 2.0 the planner tries the remaining IK branches for
+    # a more direct path before settling for a loop.
+    rrt_ik_accept_arc_chord_ratio: float | None = 2.0
     # Per-IK multi-path scoring knobs (ports SplatSim's
     # TrajectoryGenerator._generate_multiple_path_candidates pattern):
     #
