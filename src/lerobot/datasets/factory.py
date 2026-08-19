@@ -378,4 +378,14 @@ def make_train_eval_datasets(
                 for stats_type, stats in IMAGENET_STATS.items():
                     ds.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
+    if cfg.dataset.dart_relabel:
+        # This branch rebuilds datasets from scratch (episode split), so the
+        # wrap applied inside make_dataset() above is lost — reapply it, or
+        # dart_relabel would silently train on executed labels whenever
+        # eval_split > 0.
+        from lerobot.datasets.dart_relabel import maybe_wrap_dart
+
+        train_dataset = maybe_wrap_dart(train_dataset, root=cfg.dataset.root)
+        eval_dataset = maybe_wrap_dart(eval_dataset, root=cfg.dataset.root)
+
     return train_dataset, eval_dataset
