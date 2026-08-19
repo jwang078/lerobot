@@ -156,7 +156,13 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 tolerance_s=cfg.tolerance_s,
                 exclude_features=excluded_image_keys or None,
             )
+            if cfg.dataset.dart_relabel:
+                from lerobot.datasets.dart_relabel import maybe_wrap_dart
+
+                dataset = maybe_wrap_dart(dataset, root=cfg.dataset.root)
         else:
+            if cfg.dataset.dart_relabel:
+                raise ValueError("dataset.dart_relabel is not supported with streaming datasets.")
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
@@ -240,6 +246,15 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             video_backend=cfg.dataset.video_backend,
             exclude_features=excluded_image_keys or None,
         )
+        if cfg.dataset.dart_relabel:
+            # Replace relabeled-blend sub-datasets' loaded action chunks with
+            # synthesized DART labels. Wrapping the sub-dataset (not the
+            # multi) is deliberate: the wrapper consumes relabel_demo_index
+            # BEFORE MultiLeRobotDataset's disabled-features intersection
+            # deletes it from the item (raw sub-datasets lack the column).
+            from lerobot.datasets.dart_relabel import maybe_wrap_dart
+
+            multi._datasets = [maybe_wrap_dart(d, root=cfg.dataset.root) for d in multi._datasets]
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
             f"{pformat(multi.repo_id_to_index, indent=2)}"

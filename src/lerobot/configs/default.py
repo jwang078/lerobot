@@ -123,6 +123,21 @@ class DatasetConfig:
     # get silently swapped onto a different sampler. Validated at
     # __post_init__.
     use_weighted_sampling: bool = False
+    # DART train-time relabeling for blend datasets recorded with
+    # augment_dataset_with_blending --relabel_actions=guidance. When True,
+    # every loaded (sub-)dataset whose schema carries ``relabel_demo_index``
+    # gets wrapped in DartChunkDataset: its loaded action chunks are replaced
+    # by synthesized expert-response labels (demo clock resuming from the
+    # frame's projected demo index; corridor offset closing at the source
+    # demo's own cruise speed with a C1 ease-out merge — all scale-free, see
+    # lerobot.datasets.dart_relabel). Datasets without the column (raw demos,
+    # interventions, executed-label blends) pass through untouched, so the
+    # flag is safe in mixed multi-source training. Observations are never
+    # modified; actions stay ABSOLUTE positions (rel/delta policies derive
+    # corrective deltas downstream as usual). Requires the blend dataset's
+    # episode metadata to name its source via ``source_dataset_repo_id``
+    # (stamped at record time) and the source dataset to be on disk.
+    dart_relabel: bool = False
     # Per-key Gaussian noise added to observation.* features at training time
     # ONLY (not at eval-loss / rollout eval). Keys are the exact feature names
     # in a batch dict (e.g. "observation.state", "observation.environment_state");
