@@ -252,9 +252,24 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             # multi) is deliberate: the wrapper consumes relabel_demo_index
             # BEFORE MultiLeRobotDataset's disabled-features intersection
             # deletes it from the item (raw sub-datasets lack the column).
-            from lerobot.datasets.dart_relabel import maybe_wrap_dart
+            from lerobot.datasets.dart_relabel import DartChunkDataset, maybe_wrap_dart
 
             multi._datasets = [maybe_wrap_dart(d, root=cfg.dataset.root) for d in multi._datasets]
+            _wrapped = [d.dataset.repo_id for d in multi._datasets if isinstance(d, DartChunkDataset)]
+            _plain = [d.repo_id for d in multi._datasets if not isinstance(d, DartChunkDataset)]
+            logging.info(
+                "dart_relabel SUMMARY: %d/%d sub-dataset(s) DART-wrapped: %s | pass-through: %s",
+                len(_wrapped),
+                len(multi._datasets),
+                _wrapped or "NONE",
+                _plain or "none",
+            )
+            if not _wrapped:
+                logging.warning(
+                    "dataset.dart_relabel=true but NO sub-dataset carries relabel_demo_index — "
+                    "every dataset trains on its stored (executed) actions. If blends are in "
+                    "this list, they were recorded without --relabel_actions=guidance."
+                )
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
             f"{pformat(multi.repo_id_to_index, indent=2)}"
