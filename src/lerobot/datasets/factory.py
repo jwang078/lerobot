@@ -159,7 +159,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             if cfg.dataset.dart_relabel:
                 from lerobot.datasets.dart_relabel import maybe_wrap_dart
 
-                dataset = maybe_wrap_dart(dataset, root=cfg.dataset.root)
+                dataset = maybe_wrap_dart(
+                    dataset,
+                    root=cfg.dataset.root,
+                    collision_filter=cfg.dataset.blend_collision_filter,
+                    collision_margin=cfg.dataset.blend_collision_margin,
+                )
         else:
             if cfg.dataset.dart_relabel:
                 raise ValueError("dataset.dart_relabel is not supported with streaming datasets.")
@@ -254,7 +259,15 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             # deletes it from the item (raw sub-datasets lack the column).
             from lerobot.datasets.dart_relabel import DartChunkDataset, maybe_wrap_dart
 
-            multi._datasets = [maybe_wrap_dart(d, root=cfg.dataset.root) for d in multi._datasets]
+            multi._datasets = [
+                maybe_wrap_dart(
+                    d,
+                    root=cfg.dataset.root,
+                    collision_filter=cfg.dataset.blend_collision_filter,
+                    collision_margin=cfg.dataset.blend_collision_margin,
+                )
+                for d in multi._datasets
+            ]
             _wrapped = [d.dataset.repo_id for d in multi._datasets if isinstance(d, DartChunkDataset)]
             _plain = [d.repo_id for d in multi._datasets if not isinstance(d, DartChunkDataset)]
             logging.info(

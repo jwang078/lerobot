@@ -138,6 +138,15 @@ class DatasetConfig:
     # episode metadata to name its source via ``source_dataset_repo_id``
     # (stamped at record time) and the source dataset to be on disk.
     dart_relabel: bool = False
+    # Loader-side collision filtering for blend datasets that carry the
+    # per-frame ``frame_in_collision`` column (recorded by the blend rollout):
+    #   "none" (default) — no filtering;
+    #   "drop" — exclude every anchor of episodes containing any collision;
+    #   "trim_first_collision" — exclude anchors from (first collision -
+    #   blend_collision_margin) onward. Non-destructive replacement for the
+    #   replay-based filter_blend_collisions.py `_nc`/`_tfc` sibling datasets.
+    blend_collision_filter: str = "none"
+    blend_collision_margin: int = 10
     # Per-key Gaussian noise added to observation.* features at training time
     # ONLY (not at eval-loss / rollout eval). Keys are the exact feature names
     # in a batch dict (e.g. "observation.state", "observation.environment_state");
