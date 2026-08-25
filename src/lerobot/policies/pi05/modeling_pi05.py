@@ -675,17 +675,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # already carries a partial forward flow (see euler_integrate(t_start=...)).
         t_start = 1.0
         # Initialize denoising parameters
-        anchor_action: Tensor | None = kwargs.get("anchor_action")
+        chunk_anchor = kwargs.get("chunk_anchor")  # ChunkAnchor | None (see policies/common/chunk_anchor.py)
         # Sample anchor noise ONCE outside the ODE loop so all steps stay on the same
         # flow trajectory (re-sampling per step would cause chaotic velocity fields).
         anchor_noise = (
             torch.randn(
-                anchor_action.shape,
-                dtype=anchor_action.dtype,
-                device=anchor_action.device,
+                chunk_anchor.values.shape,
+                dtype=chunk_anchor.values.dtype,
+                device=chunk_anchor.values.device,
                 generator=generator,
             )
-            if anchor_action is not None
+            if chunk_anchor is not None
             else None
         )
         sa_noise_ratio = kwargs.get("sa_noise_ratio")
@@ -711,17 +711,30 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             dt = -1.0 / num_steps
 
         def _anchor_post_step(step, time, x_t):
-            # Inpainting: re-anchor the first n_anchor_steps action positions to
-            # guidance at the NEXT noise level, so the model conditions on them
-            # for the remaining steps. Fixed anchor_noise keeps one ODE trajectory.
-            if anchor_action is None or anchor_noise is None or step >= num_steps // 2:
+            # Inpainting (see ChunkAnchor): re-pin the anchored positions to the
+            # anchor values at the NEXT noise level (flow interpolant), so the
+            # model conditions on them. every_step=True re-pins after every Euler
+            # update and clamps the CLEAN values once t reaches 0 (exactness
+            # guarantee); every_step=False injects once after the first update.
+            # Fixed anchor_noise keeps one ODE trajectory.
+            if chunk_anchor is None or anchor_noise is None:
                 return x_t
-            n_a = anchor_action.shape[1]
+            if not chunk_anchor.every_step and step != 0:
+                return x_t
+            anchor = chunk_anchor.trimmed(x_t.shape[1])
+            if anchor is None:
+                return x_t
+            n_a = anchor.values.shape[1]
+            d = min(anchor.values.shape[2], x_t.shape[2])
+            m = anchor.mask[:, :d]
+            values = anchor.values[:, :, :d].to(dtype=x_t.dtype, device=x_t.device)
             t_next = time + dt
+            region = x_t[:, :n_a, :d]
             if t_next > 0:
-                x_t[:, :n_a, : anchor_action.shape[2]] = (
-                    t_next * anchor_noise + (1.0 - t_next) * anchor_action
-                )
+                pinned = t_next * anchor_noise[:, :n_a, :d].to(x_t.dtype) + (1.0 - t_next) * values
+                region[:, m] = pinned[:, m]
+            elif anchor.every_step:
+                region[:, m] = values[:, m]
             return x_t
 
         return euler_integrate(
@@ -740,7 +753,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             execution_horizon=kwargs.get("execution_horizon"),
             t_start=t_start,
             dt=dt,
-            post_step=_anchor_post_step if anchor_action is not None else None,
+            post_step=_anchor_post_step if chunk_anchor is not None else None,
         )
 
     def denoise_step(

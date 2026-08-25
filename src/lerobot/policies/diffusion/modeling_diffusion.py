@@ -33,6 +33,7 @@ import torchvision
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
+from lerobot.policies.common.chunk_anchor import ChunkAnchor
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.import_utils import _diffusers_available, require_package
 
@@ -366,7 +367,7 @@ class DiffusionModel(nn.Module):
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
         sa_noise_ratio: float | None = None,
-        anchor_action: Tensor | None = None,
+        chunk_anchor: ChunkAnchor | None = None,
         rtc_prev_chunk: Tensor | None = None,
         rtc_prefix_weights: Tensor | None = None,
         rtc_max_guidance_weight: float = 10.0,
@@ -423,21 +424,34 @@ class DiffusionModel(nn.Module):
             # Compute previous image: x_t -> x_t-1
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
 
-            # Inpainting: anchor on the first denoising step only, injecting the guidance
-            # at the next noise level so the model conditions on it for all subsequent steps.
-            if anchor_action is not None and i == 0:
-                n_a = anchor_action.shape[1]
-                t_next = timesteps[i + 1] if i + 1 < len(timesteps) else None
-                if t_next is not None:
-                    t_tensor = torch.full((batch_size,), t_next, dtype=torch.long, device=sample.device)
-                    anchor_noise = torch.randn(
-                        anchor_action.shape,
-                        dtype=anchor_action.dtype,
-                        device=anchor_action.device,
-                        generator=generator,
-                    )
-                    noisy = self.noise_scheduler.add_noise(anchor_action, anchor_noise, t_tensor)
-                    sample[:, act_start : act_start + n_a, :] = noisy
+            # Inpainting (see ChunkAnchor): overwrite the anchored positions
+            # with the anchor values forward-noised to the NEXT noise level so
+            # the model conditions on them. every_step=True re-pins after every
+            # step and clamps the CLEAN values after the final one (exactness
+            # guarantee); every_step=False injects once after the first step
+            # (soft — the model may drift the anchored positions afterwards).
+            if chunk_anchor is not None and (chunk_anchor.every_step or i == 0):
+                anchor = chunk_anchor.trimmed(sample.shape[1] - act_start)
+                if anchor is not None:
+                    n_a = anchor.values.shape[1]
+                    m = anchor.mask
+                    values = anchor.values.to(dtype=sample.dtype, device=sample.device)
+                    t_next = timesteps[i + 1] if i + 1 < len(timesteps) else None
+                    region = sample[:, act_start : act_start + n_a, :]
+                    if t_next is not None:
+                        t_tensor = torch.full((batch_size,), t_next, dtype=torch.long, device=sample.device)
+                        anchor_noise = torch.randn(
+                            values.shape,
+                            dtype=values.dtype,
+                            device=values.device,
+                            generator=generator,
+                        )
+                        noisy = self.noise_scheduler.add_noise(values, anchor_noise, t_tensor)
+                        region[:, m] = noisy[:, m]
+                    elif anchor.every_step:
+                        # Final step: clamp clean — the emitted chunk equals the
+                        # anchor exactly at the masked positions.
+                        region[:, m] = values[:, m]
 
         return sample
 
@@ -484,7 +498,7 @@ class DiffusionModel(nn.Module):
         batch: dict[str, Tensor],
         noise: Tensor | None = None,
         sa_noise_ratio: float | None = None,
-        anchor_action: Tensor | None = None,
+        chunk_anchor: ChunkAnchor | None = None,
         generator: torch.Generator | None = None,
         rtc_prev_chunk: Tensor | None = None,
         rtc_prefix_weights: Tensor | None = None,
@@ -513,7 +527,7 @@ class DiffusionModel(nn.Module):
             generator=generator,
             noise=noise,
             sa_noise_ratio=sa_noise_ratio,
-            anchor_action=anchor_action,
+            chunk_anchor=chunk_anchor,
             rtc_prev_chunk=rtc_prev_chunk,
             rtc_prefix_weights=rtc_prefix_weights,
             rtc_max_guidance_weight=rtc_max_guidance_weight,

@@ -240,6 +240,13 @@ class RelativeActionsProcessorStep(ProcessorStep):
         did_cache_update = state is not None and (has_action or queue_empty)
         if did_cache_update:
             self._last_state = state
+        import os as _os
+
+        if _os.environ.get("DAG_ANCHOR_DEBUG"):
+            print(
+                f"[rel-gate] has_action={has_action} queue_empty={queue_empty} "
+                f"cache_update={did_cache_update} policy_attached={self._policy is not None}"
+            )
         # Unconditionally remember the most recent observed state so
         # refresh_anchor() can re-anchor mid-chunk. NOT the same as
         # _last_state: this one updates every call, _last_state only at

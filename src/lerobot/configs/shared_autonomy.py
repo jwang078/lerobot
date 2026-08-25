@@ -32,7 +32,7 @@ conformity (following learned behavior distribution):
 - forward_flow_ratio = 1.0: pure policy ("blend100") — the obs-teleop source
   BYPASSES the blend machinery entirely and emits plain unguided inner-policy
   chunks at the blend cadence (no guidance encode, no x_tsw, no RTC, no
-  n_anchor_steps). Ratio 1.0 must NEVER route through DENOISE/INTERPOLATE:
+  chunk anchoring). Ratio 1.0 must NEVER route through DENOISE/INTERPOLATE:
   the 0-weight guidance term still propagates NaN (0·NaN), and a full-noise
   denoise start executes the near-zero-alpha_bar timesteps where in-loop
   corrections (rtc_prev_chunk_guidance) diverge — see the ratio>=1.0 branch
@@ -186,13 +186,36 @@ class SharedAutonomyConfig:
     # Set explicitly to override the heuristic.
     num_dofs: int | None = None
     blend_mode: str = "every_step"  # "every_step" or "once_per_chunk"
-    # Number of action steps at the start of each chunk to anchor exactly to guidance.
-    # 0 = current behavior (full-chunk blending only). k > 0: strategy-dependent —
-    # under GuidanceBlendStrategy.DENOISE the sampler re-anchors the first k steps
-    # to guidance at every denoising step (in-loop inpainting), letting the model
-    # generate a coherent continuation from those steps; under INTERPOLATE the same
-    # k steps are snapped to guidance post-hoc after the linear mix (no sampler to
-    # re-anchor inside).
+    # ── Chunk anchoring (in-loop inpainting; see policies/common/chunk_anchor.py) ──
+    # Anchor selected positions of each freshly built chunk to guidance during
+    # denoising. Under DENOISE the sampler pins those positions inside the
+    # denoise loop (the model harmonizes the rest of the chunk against them);
+    # under INTERPOLATE they're snapped post-hoc after the linear mix.
+    #   anchor_prefix_steps: first k action positions (seam continuity — the
+    #     chunk begins on the expert corridor).
+    #   anchor_suffix_steps: LAST M positions of the chunk (rejoin-by-
+    #     construction: every chunk PLANS a return to the expert corridor, so
+    #     blend-rollout deviations are bounded per chunk instead of
+    #     compounding — the forward-generation analog of backward traces).
+    #   anchor_every_denoise_step: True (default) = classic inpainting — re-pin
+    #     after every denoise step and clamp the clean values after the final
+    #     one, guaranteeing the emitted chunk equals guidance at the anchored
+    #     positions. False = single soft injection after the first step (the
+    #     model conditions on it but may drift it).
+    # SEAM NOTE (measured 2026-08-25): a suffix-anchored chunk is brisker
+    # over its executed front (the pinned tail pulls the denoise forward), so
+    # chunk seams show a forward step the plain rollout doesn't have. Pair
+    # suffix anchoring with rtc_hard_prefix_xfade >= 8 to soften it; a hard
+    # anchor_prefix_steps pin does NOT fix seams (it relocates the
+    # discontinuity to the pin/free boundary).
+    # Guidance positions that are non-finite (padding beyond the demo's end)
+    # are never anchored.
+    anchor_prefix_steps: int = 0
+    anchor_suffix_steps: int = 0
+    anchor_every_denoise_step: bool = True
+    # DEPRECATED, ignored — the old single-prefix anchor knob. Kept ONLY so
+    # config.json from existing checkpoints (which serialize this field) still
+    # deserializes; use anchor_prefix_steps / anchor_suffix_steps instead.
     n_anchor_steps: int = 0
     # ── RTC-style previous-chunk guidance (additive; DENOISE strategy) ─────
     # Real-Time Chunking (Physical Intelligence; see lerobot/policies/rtc/)
