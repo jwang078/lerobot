@@ -513,6 +513,7 @@ default.extend-ignore-identifiers-re = [
     "seperated_timestep",
     # my_scripts / DAgger tooling naming conventions:
     ".*_thr(?:_.*)?",  # threshold identifiers: abs_thr, ratio_thr, frozen_thr, jump_thr, etc.
+    "b?\\d*anc\\d+",   # blend_run_tag examples: anc8, 050anc8, b050anc8 (anchored-blend content tags)
 ]
 
 [tool.typos.default.extend-words]
