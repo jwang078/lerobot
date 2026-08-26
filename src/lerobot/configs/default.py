@@ -138,6 +138,24 @@ class DatasetConfig:
     # episode metadata to name its source via ``source_dataset_repo_id``
     # (stamped at record time) and the source dataset to be on disk.
     dart_relabel: bool = False
+    # "Base DART" (self-relabel): when this regex matches a loaded
+    # (sub-)dataset's repo_id, the dataset is DART-wrapped WITHOUT needing
+    # relabel columns — each episode serves as its own demo (identity
+    # pairing, demo_index = frame_index). Lets intervention datasets get
+    # synthesized recovery labels with no blend rollouts. Only consulted
+    # when dart_relabel=true. Example: "_r_dag[0-9]+$" matches the DAgger
+    # intervention repos but not the base dataset or blend datasets.
+    dart_self_relabel_pattern: str = ""
+    # Classic-DART train-time state noise for every DART-wrapped dataset:
+    # with probability dart_state_noise_p, perturb the sampled frame's obs
+    # state (all history rows by the SAME offset — velocity preserved) by
+    # N(0, (std * demo_med_step)^2) on the arm dims, locally re-project onto
+    # the demo polyline, and synthesize the recovery label from the
+    # perturbed state. std is in demo med-step units (scale-free across
+    # tasks); 0 disables. This is the manual noise-level dial the blend
+    # ratio replaces with policy-generated noise.
+    dart_state_noise_std: float = 0.0
+    dart_state_noise_p: float = 1.0
     # Loader-side collision filtering for blend datasets that carry the
     # per-frame ``frame_in_collision`` column (recorded by the blend rollout):
     #   "none" (default) — no filtering;

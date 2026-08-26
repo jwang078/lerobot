@@ -265,6 +265,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                     root=cfg.dataset.root,
                     collision_filter=cfg.dataset.blend_collision_filter,
                     collision_margin=cfg.dataset.blend_collision_margin,
+                    self_relabel_pattern=cfg.dataset.dart_self_relabel_pattern,
+                    state_noise_std=cfg.dataset.dart_state_noise_std,
+                    state_noise_p=cfg.dataset.dart_state_noise_p,
                 )
                 for d in multi._datasets
             ]
