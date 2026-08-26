@@ -148,10 +148,10 @@ class DatasetConfig:
     dart_self_relabel_pattern: str = ""
     # Classic-DART train-time state noise for every DART-wrapped dataset:
     # with probability dart_state_noise_p, perturb the sampled frame's obs
-    # state (all history rows by the SAME offset — velocity preserved) by
-    # N(0, (std * demo_med_step)^2) on the arm dims, locally re-project onto
-    # the demo polyline, and synthesize the recovery label from the
-    # perturbed state. std is in demo med-step units (scale-free across
+    # state by N(0, (std * demo_med_step)^2) on the arm dims, locally
+    # re-project onto the demo polyline, and synthesize the recovery label
+    # from the perturbed state; the anchor's assumed velocity is the demo
+    # tangent at the projected index (obs history rebuilt along it). std is in demo med-step units (scale-free across
     # tasks); 0 disables. This is the manual noise-level dial the blend
     # ratio replaces with policy-generated noise.
     dart_state_noise_std: float = 0.0
