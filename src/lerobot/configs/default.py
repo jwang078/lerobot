@@ -156,6 +156,14 @@ class DatasetConfig:
     # ratio replaces with policy-generated noise.
     dart_state_noise_std: float = 0.0
     dart_state_noise_p: float = 1.0
+    # Probability of serving the ORIGINAL item (real action, untouched obs,
+    # full index range incl. the demo endgame) from a DART-wrapped dataset
+    # instead of a synthesized/noised sample. Essential for prolonged
+    # training: the DART window excludes arrive-and-hold anchors, so without
+    # a raw mix a wrapped dataset teaches no goal arrival and no genuine
+    # intervention actions at all (measured: 6-14 point base-finetune
+    # collapse at raw_mix=0).
+    dart_raw_mix: float = 0.0
     # Loader-side collision filtering for blend datasets that carry the
     # per-frame ``frame_in_collision`` column (recorded by the blend rollout):
     #   "none" (default) — no filtering;
