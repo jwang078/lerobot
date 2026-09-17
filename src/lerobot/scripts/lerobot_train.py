@@ -1308,6 +1308,38 @@ def train(cfg: TrainPipelineConfig):
                 for suite, suite_info in eval_info.items():
                     logging.info("Suite %s aggregated: %s", suite, suite_info)
 
+                # Compact failure taxonomy per task: WHICH episodes failed and
+                # WHY (collision vs timeout vs other), greppable from the
+                # training log. The full per-episode telemetry (collision
+                # steps, min goal distance, lengths) is already persisted in
+                # eval/eval_info_step_<id>.json — this line exists so
+                # scenario-class analyses don't require opening the JSON
+                # (added 2026-09-06 for the dart-fix scenario taxonomy).
+                try:
+                    for _t in eval_info.get("per_task", []):
+                        _m = _t.get("metrics", {})
+                        _succ = _m.get("successes") or []
+                        _im = _m.get("info_metrics", {})
+                        _col_l = _im.get("in_collision") or []
+                        _tr_l = _im.get("truncated") or []
+                        _col = [i for i, s in enumerate(_succ) if not s and i < len(_col_l) and _col_l[i]]
+                        _tout = [
+                            i
+                            for i, s in enumerate(_succ)
+                            if not s and i < len(_tr_l) and _tr_l[i] and i not in _col
+                        ]
+                        _oth = [i for i, s in enumerate(_succ) if not s and i not in _col and i not in _tout]
+                        logging.info(
+                            "Failure taxonomy %s/%s: collision=%s timeout=%s other=%s",
+                            _t.get("task_group"),
+                            _t.get("task_id"),
+                            _col,
+                            _tout,
+                            _oth,
+                        )
+                except Exception as _e:  # non-fatal: taxonomy is a convenience
+                    logging.debug("failure-taxonomy logging skipped: %s", _e)
+
                 # meters/tracker
                 eval_metrics = {
                     "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),

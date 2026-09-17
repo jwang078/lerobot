@@ -115,6 +115,11 @@ class DiffusionPolicy(PreTrainedPolicy):
         queues_populated = any(len(q) > 0 for q in self._queues.values())
         if queues_populated:
             batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+            # The stacked-images key lives only in the queues (select_action
+            # builds it), so a caller passing the raw per-camera batch (the
+            # SA wrapper's guidance path) would otherwise drop it.
+            if OBS_IMAGES in self._queues and OBS_IMAGES not in batch and len(self._queues[OBS_IMAGES]) > 0:
+                batch[OBS_IMAGES] = torch.stack(list(self._queues[OBS_IMAGES]), dim=1)
         else:
             batch = dict(batch)
             if self.config.image_features:

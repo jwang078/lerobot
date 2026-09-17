@@ -491,6 +491,37 @@ def resume_after_prepare(
     if scheduler is not None:
         load_scheduler_state(scheduler, training_state_dir)
 
+    # The saved optimizer/scheduler state carries the checkpoint's own `lr` /
+    # `initial_lr` / `base_lrs`, so loading it silently discards a CLI override
+    # such as `--optimizer.lr=1e-6` (the config log then shows 1e-6 while the
+    # run trains at the checkpoint's peak). Re-apply the CLI-resolved value to
+    # every param group and to the scheduler's base_lrs; a no-op when no
+    # override was given.
+    if cfg.optimizer is not None and getattr(cfg.optimizer, "lr", None) is not None:
+        new_lr = float(cfg.optimizer.lr)
+        restore_needed = False
+        for opt in optimizer.values() if isinstance(optimizer, dict) else [optimizer]:
+            for pg in opt.param_groups:
+                if pg.get("lr") != new_lr or pg.get("initial_lr") != new_lr:
+                    restore_needed = True
+                pg["lr"] = new_lr
+                pg["initial_lr"] = new_lr
+        # After accelerator.prepare() the scheduler is an AcceleratedScheduler
+        # wrapper; setting base_lrs on the wrapper leaves the inner LambdaLR
+        # untouched (its next step() resets lr from ITS base_lrs). Set both.
+        for sch in {
+            id(x): x for x in (scheduler, getattr(scheduler, "scheduler", None)) if x is not None
+        }.values():
+            if hasattr(sch, "base_lrs"):
+                sch.base_lrs = [new_lr for _ in sch.base_lrs]
+            if hasattr(sch, "_last_lr"):
+                sch._last_lr = [new_lr for _ in sch._last_lr]
+        if restore_needed and accelerator.is_main_process:
+            logging.info(
+                f"[resume] Re-applied cfg.optimizer.lr={new_lr:.3g} to optimizer param_groups "
+                "and scheduler base_lrs (saved state clobbered it)."
+            )
+
 
 # ---------------------------------------------------------------------------------------------
 # Hub: checkpoint push (resume artifact) and publishing (distribution artifact)

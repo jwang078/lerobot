@@ -250,6 +250,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             image_transforms=image_transforms,
             video_backend=cfg.dataset.video_backend,
             exclude_features=excluded_image_keys or None,
+            episodes=cfg.dataset.multi_source_episodes,
         )
         if cfg.dataset.dart_relabel:
             # Replace relabeled-blend sub-datasets' loaded action chunks with
@@ -267,11 +268,24 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                     collision_margin=cfg.dataset.blend_collision_margin,
                     self_relabel_pattern=cfg.dataset.dart_self_relabel_pattern,
                     state_noise_std=cfg.dataset.dart_state_noise_std,
+                    vel_noise_std=cfg.dataset.dart_vel_noise_std,
+                    state_noise_schedule=cfg.dataset.dart_state_noise_schedule,
+                    state_noise_scale=cfg.dataset.dart_state_noise_scale,
+                    state_noise_min_sigma=cfg.dataset.dart_state_noise_min_sigma,
+                    mask_hold_tail=cfg.dataset.dart_mask_hold_tail,
                     state_noise_p=cfg.dataset.dart_state_noise_p,
                     raw_mix=cfg.dataset.dart_raw_mix,
                 )
                 for d in multi._datasets
             ]
+            if cfg.dataset.dart_selective_mask:
+                # keep base (unwrapped) datasets' terminal pads TRAINED under
+                # the global loss mask: only DART-wrapped datasets carry marks
+                from lerobot.datasets.dart_relabel import ClearPadFlags
+
+                multi._datasets = [
+                    d if isinstance(d, DartChunkDataset) else ClearPadFlags(d) for d in multi._datasets
+                ]
             _wrapped = [d.dataset.repo_id for d in multi._datasets if isinstance(d, DartChunkDataset)]
             _plain = [d.repo_id for d in multi._datasets if not isinstance(d, DartChunkDataset)]
             logging.info(

@@ -41,6 +41,11 @@ class DatasetConfig:
     episodes: list[int] | None = None
     # Episode indices to drop (e.g. corrupt or heterogeneous ones). Applied on top of `episodes`.
     exclude_episodes: list[int] | None = None
+    # Per-repo episode subsets for multi-source training (repo_id -> episode
+    # indices). Repos absent from the dict load all episodes. Used by the
+    # intervention-budget (scarcity) study to train on fractions of a round's
+    # interventions without materializing subset datasets.
+    multi_source_episodes: dict[str, list[int]] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
@@ -155,6 +160,34 @@ class DatasetConfig:
     # tasks); 0 disables. This is the manual noise-level dial the blend
     # ratio replaces with policy-generated noise.
     dart_state_noise_std: float = 0.0
+    # Phase-space DART: also perturb the anchor's assumed VELOCITY by
+    # N(0, (vel_std * demo_med_step)^2) per arm dim around the demo tangent
+    # (per-tick units; the demo's own cruise is ~1 med-step/tick). The obs
+    # history is rebuilt along the SAMPLED velocity, so the perturbation is
+    # observable, and the servo label launches from it — near-zero draws
+    # teach accelerate-from-rest corrections, off-pace draws teach retiming.
+    # 0 keeps the historical fixed demo-tangent assumption.
+    dart_vel_noise_std: float = 0.0
+    # Path to a JSON noise schedule {source_repo_id: {ep: [sigma per demo
+    # frame]}} (med-step units, measured from blend-rollout deviations).
+    # When set, per-anchor sigma comes from the schedule instead of the
+    # constant dart_state_noise_std (blend-calibrated adaptive DART).
+    dart_state_noise_schedule: str = ""
+    # Multiplier on schedule sigmas (r=0.5 blends -> 1.0; see servo notes).
+    dart_state_noise_scale: float = 1.0
+    # Truncated DART sampling: reject-and-redraw position draws whose norm
+    # is below min_sigma*sqrt(3) med-steps (the obs-jitter shell) — no
+    # sub-jitter DART corrections; jitter augmentation owns that regime.
+    # 0.55 med-steps/axis = the 0.01 rad observation.state jitter's scale.
+    dart_state_noise_min_sigma: float = 0.0
+    # Accept hold-tail chunks near the demo end and mark the held steps in
+    # action_is_pad (pair with --policy.do_mask_loss_for_padding=true) —
+    # reopens the last horizon of frames to DART noise anchors.
+    dart_mask_hold_tail: bool = False
+    # With do_mask_loss_for_padding=true: clear pad flags on datasets NOT
+    # wrapped by DART (the base demos), keeping their terminal settle
+    # supervision trained; only synthesized hold tails stay masked.
+    dart_selective_mask: bool = False
     dart_state_noise_p: float = 1.0
     # Probability of serving the ORIGINAL item (real action, untouched obs,
     # full index range incl. the demo endgame) from a DART-wrapped dataset

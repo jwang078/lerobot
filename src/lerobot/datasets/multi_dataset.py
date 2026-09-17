@@ -62,7 +62,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
             LeRobotDataset(
                 repo_id,
                 root=self.root / repo_id,
-                episodes=episodes[repo_id] if episodes else None,
+                episodes=episodes.get(repo_id) if episodes else None,
                 image_transforms=image_transforms,
                 delta_timestamps=delta_timestamps,
                 tolerance_s=self.tolerances_s[repo_id],

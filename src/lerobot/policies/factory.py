@@ -579,6 +579,7 @@ def _wrap_with_shared_autonomy(policy, cfg):
         blend_mode=sa_cfg.blend_mode,
         anchor_prefix_steps=getattr(sa_cfg, "anchor_prefix_steps", 0),
         anchor_suffix_steps=getattr(sa_cfg, "anchor_suffix_steps", 0),
+        anchor_suffix_to_goal=getattr(sa_cfg, "anchor_suffix_to_goal", False),
         anchor_every_denoise_step=getattr(sa_cfg, "anchor_every_denoise_step", True),
         rtc_prev_chunk_guidance=getattr(sa_cfg, "rtc_prev_chunk_guidance", False),
         rtc_max_guidance_weight=getattr(sa_cfg, "rtc_max_guidance_weight", 10.0),

@@ -212,6 +212,18 @@ class SharedAutonomyConfig:
     # are never anchored.
     anchor_prefix_steps: int = 0
     anchor_suffix_steps: int = 0
+    # Goal-adaptive suffix: grow the suffix to cover the chunk's whole
+    # goal-hold tail — every position whose (lag-corrected) guidance source is
+    # the repeated final demo pose. Near the goal a fixed 8-step suffix pins
+    # only the tail of a much longer hold segment, leaving the middle of the
+    # chunk free to dawdle between arrival and the pinned end; this closes
+    # that window. Effective suffix per chunk:
+    #   max(anchor_suffix_steps, goal_hold_steps - anchor_clock_lag)
+    # (the -lag matches the anchor's clock-lag shift: positions whose shifted
+    # source is still pre-arrival must not be pinned, or the anchor demands
+    # correction and full pace simultaneously). Far from the goal
+    # goal_hold_steps is 0 and this is a no-op.
+    anchor_suffix_to_goal: bool = False
     anchor_every_denoise_step: bool = True
     # DEPRECATED, ignored — the old single-prefix anchor knob. Kept ONLY so
     # config.json from existing checkpoints (which serialize this field) still
