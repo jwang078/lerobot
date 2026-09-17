@@ -36,18 +36,18 @@ class ImageResizeMode(str, Enum):
     STRETCH = "stretch"
 
 
-@RobotConfig.register_subclass("splatsim_lerobot")
 @dataclass
-class SplatSimLerobotConfig(RobotConfig):
-    """Configuration for SplatSim LeRobot simulation robot"""
+class BaseSplatSimRobotConfig(RobotConfig):
+    """Fields shared by the sim and real SplatSim-style robots.
 
-    # ZMQ connection settings
+    Not registered with draccus on its own; concrete subclasses
+    (``SplatSimLerobotConfig``, ``UR5SmallEngineConfig``) register a ``type``.
+    """
+
+    # gello ZMQ robot server connection (joint state/action). Same interface
+    # whether launch_nodes.py is serving a simulated or a real UR5.
     port: int | None = None
     hostname: str = "127.0.0.1"
-
-    # Camera ports
-    wrist_camera_port: int = 5000
-    base_camera_port: int = 5001
 
     # Control rate for RobotEnv
     control_rate_hz: int = 50
@@ -61,12 +61,12 @@ class SplatSimLerobotConfig(RobotConfig):
     # - "stretch": Resize to fill entire area without keeping aspect ratio (good for diffusion)
     image_resize_modes: list[str] = field(default_factory=lambda: ["letterbox"])
 
-    # Related to camera ports
-    # Cameras
+    # lerobot camera drivers (used by the real robot; the sim robot renders its
+    # own images and leaves this empty).
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
-    # More of a SplatSim config, which do not exist on a camera port
-    # Camera names to include in observations (e.g., ["base_rgb"], ["wrist_rgb"], or ["base_rgb", "wrist_rgb"])
+    # Camera names to include in observations
+    # (e.g., ["base_rgb"], ["wrist_rgb"], or ["base_rgb", "wrist_rgb"])
     camera_names: list[str] = field(default_factory=lambda: ["base_rgb", "wrist_rgb"])
 
     # Joint names (can be configured to match your dataset)
@@ -81,3 +81,18 @@ class SplatSimLerobotConfig(RobotConfig):
             "gripper",
         ]
     )
+
+
+@RobotConfig.register_subclass("splatsim_lerobot")
+@dataclass
+class SplatSimLerobotConfig(BaseSplatSimRobotConfig):
+    """Configuration for the SplatSim *simulation* robot.
+
+    Images are rendered by the SplatSim server and arrive embedded in the robot
+    observation, so ``cameras`` is normally left empty.
+    """
+
+    # Legacy gello camera ports (kept for backward compatibility; unused now
+    # that the sim renders images server-side).
+    wrist_camera_port: int = 5000
+    base_camera_port: int = 5001

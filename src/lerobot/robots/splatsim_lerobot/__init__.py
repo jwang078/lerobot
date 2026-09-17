@@ -14,5 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config_splatsim_lerobot import SplatSimLerobotConfig
+from .base_robot import BaseSplatSimRobot, resize_image
+from .config_splatsim_lerobot import BaseSplatSimRobotConfig, SplatSimLerobotConfig
 from .splatsim_lerobot import SplatSimLerobot
+
+__all__ = [
+    "BaseSplatSimRobot",
+    "BaseSplatSimRobotConfig",
+    "SplatSimLerobot",
+    "SplatSimLerobotConfig",
+    "resize_image",
+]

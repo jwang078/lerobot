@@ -14,13 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Import splatsim_lerobot submodule to trigger registration
-# (Other robots are imported by scripts that use them, but for new robots
-# we import here to ensure they're registered with draccus)
-from . import splatsim_lerobot  # noqa: F401
-from . import ur5_small_engine  # noqa: F401
-from .config import RobotConfig
-from .robot import Robot
-from .utils import make_robot_from_config
+from .config_ur5_small_engine import UR5SmallEngineConfig
+from .ur5_small_engine import UR5SmallEngine
 
-__all__ = ["Robot", "RobotConfig", "make_robot_from_config"]
+__all__ = ["UR5SmallEngine", "UR5SmallEngineConfig"]

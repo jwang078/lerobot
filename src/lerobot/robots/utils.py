@@ -80,6 +80,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .splatsim_lerobot import SplatSimLerobot
 
         return SplatSimLerobot(config)
+    elif config.type == "ur5_small_engine":
+        from .ur5_small_engine import UR5SmallEngine
+
+        return UR5SmallEngine(config)
     elif config.type == "openarm_follower":
         from .openarm_follower import OpenArmFollower
 
